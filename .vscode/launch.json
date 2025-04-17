@@ -1,0 +1,36 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Attach to Chrome",
+            "port": 9222,
+            "request": "attach",
+            "type": "chrome",
+            "webRoot": "${workspaceFolder}"
+        },
+        {
+            "type": "sweetpad-lldb",
+            "request": "launch",
+            "name": "Attach to running app (SweetPad)",
+            "preLaunchTask": "sweetpad: launch"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:llama_terminal}",
+            "name": "Debug LlamaTerminal",
+            "program": "${workspaceFolder:llama_terminal}/.build/debug/LlamaTerminal",
+            "preLaunchTask": "swift: Build Debug LlamaTerminal"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:llama_terminal}",
+            "name": "Release LlamaTerminal",
+            "program": "${workspaceFolder:llama_terminal}/.build/release/LlamaTerminal",
+            "preLaunchTask": "swift: Build Release LlamaTerminal"
+        }
+    ]
+}

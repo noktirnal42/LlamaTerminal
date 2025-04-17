@@ -1,0 +1,33 @@
+# macOS Files
+.DS_Store
+*/.DS_Store
+
+# Swift Package Manager Build Artifacts
+/.build/
+/.swiftpm/build/
+
+# Xcode Project Files (Xcode can generate these from Package.swift)
+# Keep Package.swift itself!
+*.xcodeproj
+*.xcworkspace
+
+# Xcode User Data
+/DerivedData/
+*.xcuserdatad/
+
+# Generated credentials or secrets (if any)
+# Add specific files here if needed, e.g., credentials.json
+
+# Other temporary files
+*~
+*.swp
+
+# Debug logs
+*.log
+
+# User-specific files
+UserInterfaceState.xcuserstate
+.idea/
+*.swp
+*~
+
