@@ -1,96 +1,88 @@
 # LlamaTerminal
 
-A modern MacOS 15.0+ terminal application with AI integration, powered by Ollama.
+[![Swift Version](https://img.shields.io/badge/Swift-6.0-orange.svg)](https://swift.org)
+[![Platform](https://img.shields.io/badge/platform-macOS%2015.0%2B-lightgrey.svg)](https://developer.apple.com/macOS)
+
+LlamaTerminal is an experimental macOS terminal application enhanced with local AI capabilities, primarily using Ollama.
+
+## Overview
+
+This application provides a standard terminal interface (powered by SwiftTerm) combined with integrated AI assistance. Users can interact with their shell as usual, but also leverage local large language models (LLMs) running via Ollama for tasks like command generation, code explanation, file modification, and more.
 
 ## Features
 
-- Full-featured terminal for zsh
-- AI integration powered by Ollama
-- Support for local and online models
-- Command and code highlighting
-- AI assistants for complex tasks
-- Open source, no subscriptions or paywalls
+*   **Standard Terminal Emulation:** Based on the robust `SwiftTerm` library.
+*   **Ollama Integration:** Connects to a local Ollama instance to run LLMs.
+*   **Model Management:** View, pull, and delete Ollama models from within the app.
+*   **AI Modes:**
+    *   **Auto Mode:** AI observes terminal interaction and provides suggestions.
+    *   **Dispatch Mode:** AI can directly execute commands or actions based on user input (with safety checks).
+    *   **(Future Modes):** Command Mode, Code Mode, etc.
+*   **AI Assistant Panel:** Dedicated UI for interacting with the AI, viewing suggestions, and managing models.
+*   **Command Bar:** Separate input field for composing commands with potential AI assistance (depending on mode).
+*   **(Planned/Potential):** Syntax highlighting, customizable themes, session tabs.
 
-## Requirements
+## Build & Run
 
-- MacOS 15.0 or higher
-- Ollama installed (for local AI models)
-- Swift 6.0 or higher (for development)
+### Prerequisites
 
-## Building
+1.  **macOS:** macOS 15.0 (Sonoma) or later.
+2.  **Xcode:** Xcode 16 or later (required for Swift 6.0).
+3.  **Ollama:** You need a running Ollama instance. Download and install it from [ollama.com](https://ollama.com/). Ensure Ollama is running before launching LlamaTerminal.
+4.  **Ollama Models:** Pull at least one model using the Ollama CLI (e.g., `ollama pull llama3`).
 
-```bash
-# Clone the repository
-git clone https://github.com/yourusername/llama_terminal.git
-cd llama_terminal
+### Building from Source
 
-# Build the project
-swift build
+1.  **Clone the Repository:**
+    ```bash
+    git clone https://github.com/noktirnal42/LlamaTerminal.git
+    cd LlamaTerminal
+    ```
 
-# Run the application
-swift run LlamaTerminal
-```
+2.  **Open in Xcode:**
+    *   You can directly open the `LlamaTerminal` directory in Xcode 16.
+    *   Alternatively, generate project files (though opening the directory directly is preferred):
+        ```bash
+        swift package generate-xcodeproj
+        open LlamaTerminal.xcodeproj
+        ```
 
-## AI Modes
+3.  **Build and Run:**
+    *   Select the `LlamaTerminal` scheme and your Mac as the target device in Xcode.
+    *   Press the Run button (▶︎) or `Cmd + R`.
 
-LlamaTerminal offers multiple AI assistance modes:
+    *   Alternatively, use the Swift Package Manager from the terminal:
+        ```bash
+        swift run LlamaTerminal
+        ```
 
-- **Auto Mode**: Get real-time suggestions as you work
-- **Dispatch Mode**: Break down complex tasks into steps
-- **Code Assistant**: Generate code and solve programming problems
-- **Command Assistant**: Get help with complex terminal commands
+## Basic Usage
 
-## Project Structure
+1.  **Launch the App:** Ensure Ollama is running, then launch LlamaTerminal.
+2.  **Terminal Interaction:** Use the main terminal pane just like any other terminal.
+3.  **AI Mode Selection:** Use the AI Mode selector (often in the status bar or AI Panel) to switch between modes (e.g., Auto, Dispatch, Disabled).
+4.  **Command Bar:** When AI is enabled, you can type commands into the bottom command bar for potential AI processing before execution.
+5.  **AI Panel:** Interact with the AI panel to manage models, view suggestions, or potentially have direct chats (depending on implementation).
 
-- **App**: Main application and entry point
-- **TerminalCore**: Core terminal emulation functionality
-- **AIIntegration**: AI model integration with Ollama
-- **UIComponents**: Reusable UI components and views
+## Architecture
 
-## License
+For details on the project's structure and module responsibilities, see [ARCHITECTURE.md](ARCHITECTURE.md).
 
-MIT License
+## API Documentation (DocC)
 
-# LlamaTerminal
+This project uses Swift-DocC for generating API documentation.
 
-A modern MacOS terminal application with AI integration, built with Swift and SwiftUI for MacOS 15.0+.
+1.  **Build Documentation:** In Xcode, select **Product > Build Documentation** (`Cmd + Shift + Ctrl + D`).
+2.  **View Documentation:** The documentation archive will open in Xcode's documentation viewer.
 
-## Features
-
-- Full-featured terminal for zsh
-- AI integration powered by Ollama
-- Support for local and online models
-- Command and code highlighting
-- AI assistants for complex tasks
-- Open source, no subscriptions or paywalls
-
-## Requirements
-
-- MacOS 15.0 or higher
-- Ollama installed (for local AI models)
-- Xcode 15.0 or higher (for development)
-
-## Building
+You can also generate documentation from the command line (ensure you have the necessary Xcode command-line tools selected):
 
 ```bash
-# Clone the repository
-git clone https://github.com/yourusername/llama_terminal.git
-cd llama_terminal
-
-# Build the project
-swift build
-
-# Run the application
-swift run LlamaTerminal
+swift package --allow-writing-to-directory ./docs generate-documentation --target TerminalCore --target AIIntegration --target SharedModels --target UIComponents --output-path ./docs
 ```
 
-## Project Structure
+*(Note: Hosting this documentation online would typically involve a separate process or CI job.)*
 
-- **App**: Main application and entry point
-- **TerminalCore**: Core terminal emulation functionality
-- **AIIntegration**: AI model integration with Ollama
-- **UIComponents**: Reusable UI components and views
+## Contributing
 
-## License
-
-MIT License
+Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
