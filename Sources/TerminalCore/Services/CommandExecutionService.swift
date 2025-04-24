@@ -86,14 +86,19 @@ public actor CommandExecutionService {
             }
         }
         
-        // Wait for process to complete with cancellation handling
-        try await withTaskCancellationHandler {
-            try await process.waitUntilExit()
-        } onCancel: {
-            if process.isRunning {
+        // Set up cancellation handler task
+        let cancellationTask = Task {
+            await waitForProcessTermination(process)
+            if Task.isCancelled && process.isRunning {
                 process.terminate()
             }
         }
+        
+        // Wait for process to complete
+        await waitForProcessTermination(process)
+        
+        // Cancel the cancellation handler task since it's no longer needed
+        cancellationTask.cancel()
         
         // Cancel timeout task since process completed
         timeoutTask.cancel()
@@ -240,28 +245,24 @@ public actor CommandExecutionService {
                 }
                 
                 // Wait for process to complete
-                do {
-                    try await process.waitUntilExit()
-                     
-                    // Cancel timeout task
-                    timeoutTask.cancel()
-                    
-                    let exitCode = Int(process.terminationStatus)
-                    let duration = Date().timeIntervalSince(startTime)
-                    
-                    // Send completion chunk
-                    continuation.yield(CommandOutputChunk(
-                        content: "",
-                        type: .complete,
-                        isComplete: true,
-                        exitCode: exitCode,
-                        duration: duration
-                    ))
-                    
-                    continuation.finish()
-                } catch {
-                    continuation.finish(throwing: error)
-                }
+                await waitForProcessTermination(process)
+                
+                // Cancel timeout task
+                timeoutTask.cancel()
+                
+                let exitCode = Int(process.terminationStatus)
+                let duration = Date().timeIntervalSince(startTime)
+                
+                // Send completion chunk
+                continuation.yield(CommandOutputChunk(
+                    content: "",
+                    type: .complete,
+                    isComplete: true,
+                    exitCode: exitCode,
+                    duration: duration
+                ))
+                
+                continuation.finish()
             }
         }
     }
@@ -322,6 +323,17 @@ public actor CommandExecutionService {
     /// Resets environment variables to system defaults
     public func resetEnvironment() {
         environment = ProcessInfo.processInfo.environment
+    }
+    
+    /// Helper method to properly wait for process termination in an async context
+    /// - Parameter process: The process to wait for
+    private func waitForProcessTermination(_ process: Process) async {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global().async {
+                process.waitUntilExit()
+                continuation.resume()
+            }
+        }
     }
 }
 

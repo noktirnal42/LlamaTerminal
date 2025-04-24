@@ -31,6 +31,18 @@ This application provides a standard terminal interface (powered by SwiftTerm) c
 3.  **Ollama:** You need a running Ollama instance. Download and install it from [ollama.com](https://ollama.com/). Ensure Ollama is running before launching LlamaTerminal.
 4.  **Ollama Models:** Pull at least one model using the Ollama CLI (e.g., `ollama pull llama3`).
 
+### Recent Terminal Fixes
+
+The terminal input and echo issues have been fixed in the latest version. The following improvements were made:
+
+1. **Terminal initialization**: Proper sequence of terminal initialization and reset
+2. **Window activation**: Fixed focus management and window activation timing
+3. **Process handling**: Improved process startup and termination logic
+4. **Echo issues**: Fixed terminal mode settings to ensure proper echo behavior
+5. **Terminal warnings**: Prevented premature "terminal session has ended" warnings
+
+These changes address input echo issues, text appearing in wrong windows, and overlapping placeholder text problems.
+
 ### Building from Source
 
 1.  **Clone the Repository:**
