@@ -3,16 +3,25 @@ import Combine
 import Darwin  // For ioctl and winsize
 import Foundation
 import SwiftTerm
+import AppKit
 
-@MainActor public class TerminalSession: ObservableObject, @preconcurrency LocalProcessDelegate, TerminalViewDelegate {
+/// Main terminal session coordinating all components
+@MainActor public class TerminalSession: ObservableObject, LocalProcessDelegate, TerminalViewDelegate, ShellCommandExecutor, TerminalConfigurationDelegate, OutputProcessingDelegate {
+    // MARK: - Published Properties
+    
+    /// Whether the terminal session is running
     @Published public var isRunning: Bool = false
+    
+    /// Last output received from the terminal
     @Published public var lastOutput: String = ""
+    
+    /// Current working directory
     @Published public var currentWorkingDirectory: String?
-
+    
     // Terminal dimensions
     @Published public private(set) var currentCols: Int = 80
     @Published public private(set) var currentRows: Int = 25
-
+    
     // Syntax highlighting
     @Published public private(set) var currentTheme: HighlightTheme
     @Published public var syntaxHighlightingEnabled: Bool = true
@@ -27,38 +36,69 @@ import SwiftTerm
     @Published public private(set) var isProcessingAI: Bool = false
     @Published public private(set) var lastAIContext: String?
 
-    // SwiftTerm Integration
-    weak var terminalView: SwiftTerm.TerminalView?
-    private var localProcess: SwiftTerm.LocalProcess?
-
-    // Shell configuration
-    // Use interactive login shell to ensure proper environment setup
-    private let shell: String = "/bin/zsh"
-    private let shellArgs: [String] = ["-i", "-l"]  // Interactive and login shell
-
-    // Buffer for typed commands before sending (if needed by UI)
-    var commandBuffer: String = ""
+    // MARK: - Components
     
-    // Input handling flags
-    private var isHandlingInput = false
-    private var pendingInput = Data()
-
-    // Removed duplicate process property since localProcess is the actual instance used
-    private let commandHighlighter: ShellCommandHighlighter
-    private let codeHighlighter: CodeHighlighter
-    private var commandExecutionService: CommandExecutionService
-    private var cancellables = Set<AnyCancellable>()
-
+    /// Terminal view reference
+    weak var terminalView: SwiftTerm.TerminalView?
+    
+    /// Process manager for shell interaction
+    private var processManager: DefaultProcessManager?
+    
+    /// Terminal configuration
+    private let terminalConfiguration: DefaultTerminalConfiguration
+    
+    /// Window manager
+    private let windowManager: DefaultTerminalWindowManager
+    
+    /// Input handler
+    private let inputHandler: DefaultTerminalInputHandler
+    
+    /// Output handler
+    private let outputHandler: DefaultTerminalOutputHandler
+    
+    /// State manager
+    private let stateManager: DefaultTerminalStat    /// Initializes a new terminal session with the given theme
+    /// - Parameter theme: Theme to use for syntax highlighting
     public init(theme: HighlightTheme = .dark) {
-        // Initialize currentWorkingDirectory, could fetch from FileManager
+        print("[TerminalSession] Initializing with theme: \(theme.name)")
+        
+        // Initialize basic properties
         self.currentWorkingDirectory = FileManager.default.currentDirectoryPath
         self.currentTheme = theme
+        
+        // Initialize highlighters
         self.commandHighlighter = ShellCommandHighlighter()
         self.codeHighlighter = CodeHighlighter()
+        
+        // Initialize AI coordinator
         self.aiCoordinator = AITerminalCoordinator()
+        
+        // Initialize command execution service
         self.commandExecutionService = CommandExecutionService()
-
-        // Set up safety confirmation handler
+        
+        // Initialize components in correct order
+        self.terminalConfiguration = DefaultTerminalConfiguration()
+        self.windowManager = DefaultTerminalWindowManager(terminalConfiguration: terminalConfiguration)
+        self.inputHandler = DefaultTerminalInputHandler(windowManager: windowManager)
+        self.outputHandler = DefaultTerminalOutputHandler()
+        self.stateManager = DefaultTerminalStateManager()
+        
+        // Set up delegates
+        self.windowManager.configurationDelegate = self
+        self.terminalConfiguration.shellCommandDelegate = self
+        self.outputHandler.outputProcessingDelegate = self
+        
+        // Set up initial state
+        self.stateManager.updateState(TerminalState(
+            isRunning: false,
+            currentWorkingDirectory: self.currentWorkingDirectory,
+            cols: self.currentCols,
+            rows: self.currentRows,
+            syntaxHighlightingEnabled: self.syntaxHighlightingEnabled,
+            theme: self.currentTheme
+        ))
+        
+        // Set up safety confirmation handler for AI
         Task {
             await self.aiCoordinator.setSafetyConfirmationHandler {
                 @Sendable
@@ -68,6 +108,11 @@ import SwiftTerm
                         completion(false)
                         return
                     }
+                    self.requestActionConfirmation(action, completion: completion)
+                }
+            }
+        }
+    }
                     self.requestActionConfirmation(action, completion: completion)
                 }
             }
@@ -95,13 +140,13 @@ import SwiftTerm
             print("[TerminalSession] Window activation needed")
             
             // First, ensure window is visible and key
-            window.makeKeyAndOrderFront(nil)
+            window.makeKeyAndOrderFront(self)
             
             // Then set first responder
             if window.firstResponder !== view {
                 print("[TerminalSession] Setting first responder to terminal view")
                 window.makeFirstResponder(view)
-                view.becomeFirstResponder()
+                let _ = view.becomeFirstResponder()
             }
             
             // Force cursor visibility and state refresh after activation
@@ -110,25 +155,25 @@ import SwiftTerm
                 "\u{1b}[?12l",    // Disable local echo
                 "\u{1b}[4l",      // Reset insert mode
             ].joined()
-            view.feed(txt: refreshSequence)
+            view.feed(text: refreshSequence)
             
-            // Give a moment for activation to take effect, then verify again
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+            // Verify activation was successful and retry if needed
+            DispatchQueue.main.async { [weak self] in
                 guard let self = self else { return }
-                
                 if !window.isKeyWindow || window.firstResponder !== view {
                     print("[TerminalSession] Window activation verification failed, retrying")
-                    window.makeKeyAndOrderFront(nil)
+                    window.makeKeyAndOrderFront(self)
                     window.makeFirstResponder(view)
-                    view.becomeFirstResponder()
-                    self.refreshTerminalState()
+                    let _ = view.becomeFirstResponder()
+                            if self.isRunning {
+                        self.refreshTerminalState()
+                    if self.isRunning {
+                        self.refreshTerminalState()
+                    }
                 }
             }
-        }
-    }
     
     /// Ensures the terminal view has proper focus
-    /// Ensures the terminal view has proper focus - REMOVED, use ensureWindowActive instead
     private func refreshTerminalState() {
         guard let view = terminalView else { return }
         
@@ -143,22 +188,22 @@ import SwiftTerm
             "\u{1b}[?12l",    // Disable local echo (crucial for proper echo behavior)
             "\u{1b}[4l",      // Reset insert mode (crucial for proper cursor behavior)
             "\u{1b}[20h",     // Set newline mode (LNM)
-            "\u{1b}]0;LlamaTerminal\u{7}", // Reset window title (helps with focus issues)
+            "\u{1b}]0;LlamaTerminal\u{7}" // Reset window title (helps with focus issues)
         ].joined()
         
         // Set proper terminal options through the terminal object if available
-        if let terminal = view.getTerminal() {
+        if let terminal = view.terminal {
             // These options are crucial for proper terminal behavior
-            terminal.setOption(.cursorVisible, true)
-            terminal.setOption(.cursorBlink, true)
-            terminal.setOption(.bracketedPasteMode, true)
-            terminal.setOption(.altSendsEscape, true)   // Ensure Alt/Meta keys work properly
-            terminal.setOption(.allowMouseReporting, true) // Make mouse clicks work in apps like vim
+            if let options = terminal.options {
+                options.insert(.cursorBlink)
+                options.insert(.cursorVisible)
+                options.insert(.bracketedPaste)
+                options.insert(.allowMouseReporting)
+            }
         }
-        
         // Send control sequences to terminal
         print("[TerminalSession] Sending terminal control sequences")
-        view.feed(txt: refreshSequence)
+        view.feed(text: refreshSequence)
         
         // If we have a running process, also send some stty commands to ensure proper echo
         if isRunning, let proc = localProcess {
@@ -192,38 +237,33 @@ import SwiftTerm
         print("[TerminalSession] Initializing terminal view")
         self.terminalView = view
         
-        // Set delegate
-        view.delegate = self
-        
-        // Configure terminal view colors first
+        // Configure colors
         view.configureNativeColors()
-        view.installColors(.defaultDark)
         
-        // Clear screen and ensure clean state before any other initialization
-        view.feed(txt: "\u{1b}[2J\u{1b}[H")  // Clear screen and home cursor
-        Thread.sleep(forTimeInterval: 0.05)  // Brief pause
+        // Clear screen and ensure clean state
+        view.feed(text: "\u{1b}[2J\u{1b}[H")  // Clear screen and home cursor
         
-        // Initialize terminal size
-        if let size = view.getOptimalTtySize() {
-            self.currentCols = size.cols > 0 ? Int(size.cols) : 80
-            self.currentRows = size.rows > 0 ? Int(size.rows) : 25
-        }
-        
-        // Perform basic initialization immediately
-        if let terminal = view.getTerminal() {
+        // Set initial size
+        self.currentCols = 80
+        self.currentRows = 25
+        // Initialize terminal with options
+        if let terminal = view.terminal {
             terminal.resetToInitialState()
-            terminal.setOption(.cursorVisible, true)
-            terminal.setOption(.cursorBlink, true)
-            terminal.setOption(.bracketedPasteMode, true)
-            terminal.setEncoding(.utf8)
+            if let options = terminal.options {
+                options.insert(.allowMouseReporting)
+                options.insert(.bracketedPaste)
+                options.insert(.cursorBlink)
+                options.insert(.cursorVisible)
+            }
+        }
         }
         
         // Set initial window state
         if let window = view.window {
             DispatchQueue.main.sync {
-                window.makeKeyAndOrderFront(nil)
+                window.makeKeyAndOrderFront(self)
                 window.makeFirstResponder(view)
-                view.becomeFirstResponder()
+                let _ = view.becomeFirstResponder()
             }
         }
     }
@@ -234,18 +274,19 @@ import SwiftTerm
         print("[TerminalSession] Performing full terminal reset sequence")
         
         // First, use the SwiftTerm built-in reset capabilities
-        if let terminal = view.getTerminal() {
+        if let terminal = view.terminal {
+            terminal.resetToInitialState()
+        if let terminal = view.terminal {
             terminal.resetToInitialState()
             
             // Set essential terminal options
-            terminal.setOption(.allowMouseReporting, true)
-            terminal.setOption(.bracketedPasteMode, true)
-            terminal.setOption(.cursorBlink, true)
-            terminal.setOption(.cursorVisible, true)
-            terminal.setEncoding(.utf8)
+            if let options = terminal.options {
+                options.insert(.cursorBlink)
+                options.insert(.cursorVisible)
+                options.insert(.bracketedPaste)
+                options.insert(.allowMouseReporting)
+            }
         }
-        
-        // Apply single, consolidated reset sequence in proper order
         // The order of these commands is critical for proper terminal behavior
         let resetSequence = [
             "\u{1b}c",         // RIS - Full terminal reset
@@ -263,95 +304,54 @@ import SwiftTerm
         ].joined()
         
         // Send the reset sequence
-        view.feed(txt: resetSequence)
+        view.feed(text: resetSequence)
         
         // Give terminal a moment to process, then clear screen once more
-        Thread.sleep(forTimeInterval: 0.05)
-        view.feed(txt: "\u{1b}[2J\u{1b}[H\u{1b}[?25h") // Clear, home cursor, and show cursor
-    }
-    
+    /// Starts a new terminal session
+    /// - Parameter terminalView: Terminal view to attach to
     @MainActor public func startSession(terminalView: SwiftTerm.TerminalView) async {
-        print("[TerminalSession] startSession called.")
+        print("[TerminalSession] Starting new terminal session")
         
-        // Reset state
-        self.isRunning = false
-        self.pendingInput = Data()
-        self.isHandlingInput = false
-        self.lastOutput = ""
+        // Reset component state
+        resetAllComponents()
         
-        // STEP 1: Initialize terminal view first with proper setup
-        // Initialize the terminal view before anything else to ensure proper setup
-        initializeTerminalView(terminalView)
+        // Save terminal view reference
+        self.terminalView = terminalView
         
-        // STEP 2: Ensure window activation - CRITICAL for preventing input echo issues
-        if let view = terminalView, let window = view.window {
-            print("[TerminalSession] Activating window before process start")
-            
-            // Use synchronous activation to ensure proper window focus
-            DispatchQueue.main.sync {
-                // First, ensure window is ordered front
-                window.makeKeyAndOrderFront(nil)
-                Thread.sleep(forTimeInterval: 0.05) // Brief pause for window operation
-                
-                // Then set focus
-                window.makeFirstResponder(view)
-                view.becomeFirstResponder()
-            }
-            
-            // Wait for window activation to take effect
-            Thread.sleep(forTimeInterval: 0.1)
-        }
+        // Set up terminal view delegate
+        terminalView.delegate = self
         
-        // STEP 3: Initialize LocalProcess with proper PTY configuration
-        self.localProcess = SwiftTerm.LocalProcess(delegate: self)
-        guard let localProcess = self.localProcess else {
-            print("[TerminalSession] Error: Failed to create LocalProcess.")
+        // STEP 1: Initialize terminal view with proper configuration
+        terminalConfiguration.initializeTerminal(terminalView: terminalView)
+        
+        // STEP 2: Set up input handler with terminal view
+        inputHandler.setTerminalView(terminalView)
+        
+        // STEP 3: Ensure window has focus
+        windowManager.activateWindow(terminalView: terminalView)
+        
+        // Wait for window activation to take effect
+        try? await Task.sleep(for: .milliseconds(100))
+        
+        // STEP 4: Create new process manager
+        self.processManager = DefaultProcessManager()
+        if processManager == nil {
+            print("[TerminalSession] Error: Failed to create ProcessManager")
             
             // Display error in terminal view
-            if let view = self.terminalView {
-                view.feed(txt: "\r\nFailed to initialize terminal process. Please restart the application.\r\n")
-            }
-            
+            terminalView.feed(text: "\r\nFailed to initialize terminal process. Please restart the application.\r\n")
             self.lastOutput = "Failed to initialize terminal process handler."
             return
         }
         
-        // STEP 4: Set up environment variables
-        var environment = ProcessInfo.processInfo.environment
-        // Terminal behavior variables
-        environment["TERM"] = "xterm-256color"
-        environment["TERMINFO"] = "/usr/share/terminfo"
-        environment["COLORTERM"] = "truecolor"
-        environment["INSIDE_LLAMA_TERMINAL"] = "1"
-        
-        // Colors and display variables
-        environment["CLICOLOR"] = "1"
-        environment["CLICOLOR_FORCE"] = "1"
-        
-        // Shell variables
-        environment["SHELL"] = shell
-        environment["PATH"] = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-        environment["HOME"] = ProcessInfo.processInfo.environment["HOME"]
-        environment["USER"] = ProcessInfo.processInfo.environment["USER"]
-        environment["LOGNAME"] = ProcessInfo.processInfo.environment["USER"]
-        environment["PWD"] = FileManager.default.currentDirectoryPath
-        
-        // Let shell handle its own initialization (don't override PS1)
-        environment.removeValue(forKey: "ZDOTDIR")
-        environment.removeValue(forKey: "PS1")
-        
-        // Convert environment to string array
-        let envStrings = environment.map { "\($0.key)=\($0.value)" }
-        
-        // STEP 5: Final verification of window and terminal state before process start
-        if let view = terminalView, let window = view.window {
-            // One last check to ensure the window is active and view is first responder
-            if !window.isKeyWindow || window.firstResponder !== view {
+        // Set process delegate
+        processManager?.delegate = self
+            
                 print("[TerminalSession] Window not properly activated, forcing activation")
                 DispatchQueue.main.sync {
-                    window.makeKeyAndOrderFront(nil)
+                    window.makeKeyAndOrderFront(self)
                     window.makeFirstResponder(view)
-                    view.becomeFirstResponder()
+                    let _ = view.becomeFirstResponder()
                 }
             }
             
@@ -364,26 +364,28 @@ import SwiftTerm
             // Ensure window is active before starting process (critical for input focus)
             print("[TerminalSession] Final window activation before process start")
             DispatchQueue.main.sync {
-                window.makeKeyAndOrderFront(nil)
+                window.makeKeyAndOrderFront(self)
                 window.makeFirstResponder(view)
-                view.becomeFirstResponder()
+                let _ = view.becomeFirstResponder()
             }
             // Give time for activation to take effect
-            Thread.sleep(forTimeInterval: 0.1)
+            try? await Task.sleep(for: .milliseconds(100))
         }
         
         // STEP 6: Start the process with proper error handling
         do {
             // Start the process with environment and shell args
             print("[TerminalSession] Starting LocalProcess with command: \(shell) \(shellArgs.joined(separator: " "))")
-            try localProcess.startProcess(
+            localProcess.startProcess(
                 executable: self.shell,
                 args: shellArgs,
-                environment: envStrings,
-                cols: UInt16(self.currentCols),    // Add current size
-                rows: UInt16(self.currentRows)     // Add current size
+                environment: envStrings
             )
             
+            // Update process size
+            if let process = localProcess {
+                process.setSize(rows: UInt16(self.currentRows), cols: UInt16(self.currentCols))
+            }
             // Mark as running only after process starts successfully
             self.isRunning = true
             
@@ -393,7 +395,7 @@ import SwiftTerm
             print("[TerminalSession] Error starting process: \(error.localizedDescription)")
             
             if let view = self.terminalView {
-                view.feed(txt: "\r\nError starting terminal process: \(error.localizedDescription)\r\n")
+                view.feed(text: "\r\nError starting terminal process: \(error.localizedDescription)\r\n")
             }
             
             self.lastOutput = "Failed to start terminal process: \(error.localizedDescription)"
@@ -443,14 +445,30 @@ import SwiftTerm
                 ]
                 
                 // Send commands in stages with proper error handling
-                async let stage1 = self.sendCommands(initCommands1, delay: 100_000_000)  // 100ms delay
-                await stage1
+                // Use simple inline commands instead of the sendCommands method
+                for cmd in initCommands1 {
+                    if let proc = self.localProcess, self.isRunning {
+                        proc.send(data: ArraySlice((cmd + "\n").utf8))
+                        try await Task.sleep(nanoseconds: 100_000_000)
+                    }
+                }
+                // Fixed: remove reference to stage1 which doesn't exist anymore
                 
-                async let stage2 = self.sendCommands(initCommands2, delay: 75_000_000)   // 75ms delay
-                await stage2
+                // Process second batch of commands
+                for cmd in initCommands2 {
+                    if let proc = self.localProcess, self.isRunning {
+                        proc.send(data: ArraySlice((cmd + "\n").utf8))
+                        try await Task.sleep(nanoseconds: 75_000_000)
+                    }
+                }
                 
-                async let stage3 = self.sendCommands(initCommands3, delay: 50_000_000)   // 50ms delay
-                await stage3
+                // Process third batch of commands
+                for cmd in initCommands3 {
+                    if let proc = self.localProcess, self.isRunning {
+                        proc.send(data: ArraySlice((cmd + "\n").utf8))
+                        try await Task.sleep(nanoseconds: 50_000_000)
+                    }
+                }
                 
                 // Final window activation after all initialization
                 try await Task.sleep(nanoseconds: 200_000_000)  // 200ms delay for everything to settle
@@ -461,7 +479,7 @@ import SwiftTerm
                         // Only activate if not already active
                         if !window.isKeyWindow || window.firstResponder !== view {
                             // Force refresh before activation for best results
-                            view.feed(txt: "\u{1b}[?25h") // Just ensure cursor is visible
+                            view.feed(text: "\u{1b}[?25h") // Just ensure cursor is visible
                             self.ensureWindowActive()
                         }
                     }
@@ -476,23 +494,7 @@ import SwiftTerm
     }  // End of startSession function
     
     /// Helper to send a batch of shell commands with proper error handling
-    private func sendCommands(_ commands: [String], delay: UInt64) async {
-        for cmd in commands {
-            guard self.isRunning, let proc = self.localProcess else {
-                print("[TerminalSession] Process not available for command: \(cmd)")
-                break
-            }
-            
-            proc.send(data: ArraySlice((cmd + "\n").utf8))
-            
-            // Wait briefly between commands to ensure they're processed correctly
-            do {
-                try await Task.sleep(nanoseconds: delay)
-            } catch {
-                print("[TerminalSession] Error in sleep between commands: \(error.localizedDescription)")
-            }
-        }
-    }
+    // Removed sendCommands method - functionality integrated directly into terminal configuration task
 
     public func sendToProcess(data: ArraySlice<UInt8>) {
         guard isRunning, let localProcess = self.localProcess else {
@@ -541,13 +543,12 @@ import SwiftTerm
         
         // Update terminal size
         if let process = localProcess, isRunning {
-            process.resize(rows: UInt16(rows), cols: UInt16(cols))
-            
+            process.setSize(rows: UInt16(rows), cols: UInt16(cols))
             // Send updated size to terminal
             if let view = terminalView {
                 // Update terminal about its new size
                 let sizeSequence = "\u{1b}[8;\(rows);\(cols)t"
-                view.feed(txt: sizeSequence)
+                view.feed(text: sizeSequence)
             }
         }
     }
@@ -605,7 +606,7 @@ import SwiftTerm
         // Keep terminal view active but clear screen
         if let view = terminalView {
             // Clear screen and reset cursor
-            view.feed(txt: "\u{1b}[2J\u{1b}[H")
+            view.feed(text: "\u{1b}[2J\u{1b}[H")
             
             // Display termination message
             let terminationMessage = """
@@ -614,7 +615,7 @@ import SwiftTerm
                 Press Enter to start a new session, or use Command+N for a new window.
                 \r\n
                 """
-            view.feed(txt: terminationMessage)
+            view.feed(text: terminationMessage)
             
             // Ensure terminal view remains first responder using our consolidated method
             ensureWindowActive()
@@ -1063,12 +1064,38 @@ import SwiftTerm
     
     public func sizeChanged(source: TerminalView, newCols: Int, newRows: Int) {
         print("[TerminalSession] Size changed: \(newCols)x\(newRows)")
-        updateSize(cols: newCols, rows: newRows)
+        Task { @MainActor in
+            updateSize(cols: newCols, rows: newRows)
+        }
     }
     
     public func setTerminalTitle(source: TerminalView, title: String) {
-        if let window = source.window {
-            window.title = title
+        Task { @MainActor in
+            if let window = source.window {
+                window.title = title
+            }
         }
     }
-}  // End of TerminalSession class
+    
+    public func hostCurrentDirectoryUpdate(source: TerminalView, directory: String?) {
+        Task { @MainActor in
+            self.currentWorkingDirectory = directory
+        }
+    }
+    
+    public func send(source: TerminalView, data: ArraySlice<UInt8>) {
+        Task { @MainActor in
+            sendToProcess(data: data)
+        }
+    }  // End of send method
+    
+    // Add required delegate methods missing from implementation
+    public func clipboardCopy(source: TerminalView, content: Data) {
+        // Handle clipboard copy
+    }
+    
+    public func rangeChanged(source: TerminalView, startY: Int, endY: Int) {
+        // Handle range changes
+    }
+    
+} // End of TerminalSession class
