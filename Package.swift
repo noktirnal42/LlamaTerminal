@@ -57,6 +57,7 @@ let package = Package(
             name: "TerminalCore",
             dependencies: [
                 .product(name: "SwiftTerm", package: "SwiftTerm"),
+                "SharedModels", // Add SharedModels as a dependency
             ],
             path: "Sources/TerminalCore",
             swiftSettings: [
@@ -69,6 +70,7 @@ let package = Package(
             dependencies: [
                 "Alamofire",
                 .product(name: "Markdown", package: "swift-markdown"),
+                "SharedModels", // Add SharedModels as a dependency
             ],
             path: "Sources/AIIntegration",
             swiftSettings: [
@@ -79,8 +81,8 @@ let package = Package(
         .target(
             name: "SharedModels",
             dependencies: [
-                "TerminalCore",
-                "AIIntegration",
+                // AIIntegration dependency removed to fix circular dependency
+                // SharedModels should be a base module with no internal dependencies
             ],
             path: "Sources/SharedModels",
             swiftSettings: [

@@ -10,6 +10,9 @@ public actor AutoModeHandler: AIModeHandler {
     /// Current state of the handler
     private var state: AIModeState = AIModeState()
     
+    /// Service for executing commands
+    private let commandService: CommandService
+    
     /// Service for parsing and analyzing commands
     private let parsingService: CommandParsingService
     
@@ -29,6 +32,13 @@ public actor AutoModeHandler: AIModeHandler {
     /// Cooldown mechanism to avoid too frequent suggestions
     private var lastSuggestionTime: Date = Date.distantPast
     private let suggestionCooldown: TimeInterval = 5.0 // Seconds between suggestions
+    
+    /// Formatter for displaying timestamps
+    private let timestampFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm:ss"
+        return formatter
+    }()
     
     /// Structure to track context entries with timestamps
     private struct ContextEntry: Codable, Sendable {
@@ -51,6 +61,7 @@ public actor AutoModeHandler: AIModeHandler {
     /// - Parameter model: Name of the AI model to use
     public init(model: String) {
         self.model = model
+        self.commandService = CommandService()
         self.parsingService = CommandParsingService()
         self.completionService = ChatCompletionService()
     }
@@ -58,16 +69,19 @@ public actor AutoModeHandler: AIModeHandler {
     /// Initializes a new handler with the specified AI model and services
     /// - Parameters:
     ///   - model: Name of the AI model to use
+    ///   - commandService: Service for executing commands
     ///   - parsingService: Service for parsing and analyzing commands
     ///   - completionService: Service for AI completions
     ///   - aiModel: The AI model details
     public init(
         model: String,
+        commandService: CommandService,
         parsingService: CommandParsingService,
         completionService: ChatCompletionService = ChatCompletionService(),
         aiModel: AIModel? = nil
     ) {
         self.model = model
+        self.commandService = commandService
         self.parsingService = parsingService
         self.completionService = completionService
         self.aiModel = aiModel
@@ -408,182 +422,171 @@ public actor AutoModeHandler: AIModeHandler {
         // If we detected a specific pattern, add specialized instructions
         if let patternType = patternType {
             switch patternType {
-            case .fileManagement:
-                return basePrompt + "\n\nThis command involves file operations. Focus on efficient file management, backup suggestions, or improved syntax for file operations."
-                
+            case .fileSystem:
+                return basePrompt + "\n\nThis command involves file operations. Focus on efficient file management alternatives and safety considerations. Suggest more efficient ways to organize, search, or manipulate files. Include guidance about backups before destructive operations."
             case .searchPattern:
-                return basePrompt + "\n\nThis command involves searching. Suggest more efficient search approaches, filtering options, or ways to process the search results."
-                
-            case .networkOperation:
-                return basePrompt +
-
-import Foundation
-
-/// Handler for Auto Mode - provides automatic assistance based on terminal activity
-public actor AutoModeHandler: AIModeHandler {
-    // MARK: - Properties
-
-    /// The AI model used by this handler
-    public let model: String
-
-    /// Current state of the handler
-    private var state: AIModeState = AIModeState()
-
-    /// Service for executing commands
-    private let commandService: CommandService
-
-    /// Service for parsing and analyzing commands
-    private let parsingService: CommandParsingService
-
-    // MARK: - Initialization
-
-    /// Initializes a new handler with the specified AI model
-    /// - Parameter model: Name of the AI model to use
-    public init(model: String) {
-        self.model = model
-        self.commandService = CommandService()
-        self.parsingService = CommandParsingService()
+                return basePrompt + "\n\nThis command involves searching for content. Suggest more powerful search techniques using grep, find, ag (silver searcher), or ripgrep. Focus on filtering options, recursive search capabilities, and combining tools for more effective searches."
+            case .network:
+                return basePrompt + "\n\nThis command performs network operations. Suggest improvements related to security, efficiency, or better networking tools. Consider providing options for downloading, uploading, or diagnosing network issues."
+            case .packageManagement:
+                return basePrompt + "\n\nThis command involves package management. Focus on suggestions related to updating, installing, or managing dependencies. Provide options for better dependency tracking or troubleshooting package-related issues."
+            case .versionControl:
+                return basePrompt + "\n\nThis command uses git. Suggest more effective git workflows, relevant git commands for the current context, or ways to handle common git issues like merge conflicts or branch management."
+            case .containerization:
+                return basePrompt + "\n\nThis command involves container technology like Docker or Kubernetes. Provide specialized suggestions for container management, debugging, optimization, or security best practices."
+            case .processManagement:
+                return basePrompt + "\n\nThis command deals with process management. Suggest better ways to monitor, control, or debug processes. Include optimization techniques for resource usage or troubleshooting methods."
+            case .textProcessing:
+                return basePrompt + "\n\nThis command involves text processing. Suggest more powerful text manipulation tools like awk, sed, or jq. Focus on data transformation, extraction, or formatting capabilities."
+            case .systemConfig:
+                return basePrompt + "\n\nThis command involves system configuration. Suggest improvements to configure, manage, or optimize system settings. Focus on best practices and security considerations."
+            case .archiveManagement:
+                return basePrompt + "\n\nThis command deals with archive operations. Suggest better ways to compress, extract, or manage archived files. Include options for different archive formats and optimizations."
+            case .shellScripting:
+                return basePrompt + "\n\nThis command involves shell scripting. Suggest better scripting practices, more efficient ways to accomplish the task, or alternative approaches using shell features."
+            case .database:
+                return basePrompt + "\n\nThis command involves database operations. Suggest improvements for database management, querying, or optimization techniques."
+            case .other:
+                return basePrompt + "\n\nAnalyze this command and suggest relevant improvements, alternatives, or best practices based on its purpose."
+            }
+        }
+        
+        return basePrompt
     }
-
-    /// Initializes a new handler with the specified AI model and services
+    
+    /// Generates AI response based on the provided system prompt and user message
     /// - Parameters:
-    ///   - model: Name of the AI model to use
-    ///   - commandService: Service for executing commands
-    ///   - parsingService: Service for parsing and analyzing commands
-    public init(
-        model: String,
-        commandService: CommandService,
-        parsingService: CommandParsingService
-    ) {
-        self.model = model
-        self.commandService = commandService
-        self.parsingService = parsingService
-    }
-
-    // MARK: - AIModeHandler Implementation
-
-    /// Gets the current state of the handler
-    public func getState() -> AIModeState {
-        return state
-    }
-
-    /// Processes new terminal input
-    /// - Parameter input: User's terminal input
-    /// - Returns: Response with command suggestions
-    public func processInput(_ input: String) async throws -> AIModeResponse {
-        // Generate suggestions based on the input
-        let suggestions = try await generateSuggestions(for: input)
-
-        return AIModeResponse(
-            suggestions: suggestions,
-            context: "Based on your command"
-        )
-    }
-
-    /// Handles the result of a command execution
-    /// - Parameter result: Result of command execution
-    /// - Returns: Response with context-specific feedback
-    public func handleCommandResult(_ result: CommandResult) async throws -> AIModeResponse {
-        // Analyze the command result
-        let analysis = try await analyzeCommandResult(result)
-
-        return AIModeResponse(
-            suggestions: analysis.suggestions,
-            context: analysis.context
-        )
-    }
-
-    /// Resets the handler state
-    public func reset() async {
-        state = AIModeState()
-    }
-
-    // MARK: - Private Methods
-
-    /// Generates command suggestions based on user input
-    /// - Parameter input: User's terminal input
-    /// - Returns: Array of command suggestions
-    private func generateSuggestions(for input: String) async throws -> [CommandSuggestion] {
-        // TODO: Implement AI-based suggestion generation
-        // For now, implement a simple pattern-matching approach
-
-        let trimmedInput = input.trimmingCharacters(in: .whitespacesAndNewlines)
-
-        if trimmedInput.hasPrefix("git") {
-            return [
-                CommandSuggestion(
-                    command: "git status",
-                    explanation: "Check the status of your git repository",
-                    safetyLevel: .safe
-                ),
-                CommandSuggestion(
-                    command: "git pull",
-                    explanation: "Pull latest changes from the remote repository",
-                    safetyLevel: .safe
-                ),
-            ]
-        } else if trimmedInput.hasPrefix("ls") {
-            return [
-                CommandSuggestion(
-                    command: "ls -la",
-                    explanation: "List all files with detailed information",
-                    safetyLevel: .safe
-                )
-            ]
+    ///   - systemPrompt: The system prompt to guide the AI
+    ///   - userMessage: The user message providing context
+    ///   - temperature: Sampling temperature for the AI
+    /// - Returns: The AI response text
+    private func generateAIResponse(
+        systemPrompt: String,
+        userMessage: String,
+        temperature: Double
+    ) async throws -> String {
+        // Check if we have a valid AI model
+        guard let model = self.aiModel else {
+            throw AIServiceError.invalidModel(name: self.model)
         }
-
-        // Default suggestions
-        return [
-            CommandSuggestion(
-                command: "echo $PATH",
-                explanation: "Display your PATH environment variable",
-                safetyLevel: .safe
-            )
+        
+        // Prepare messages for completion
+        let messages: [ChatMessage] = [
+            ChatMessage(role: .system, content: systemPrompt),
+            ChatMessage(role: .user, content: userMessage)
         ]
+        
+        // Generate completion
+        let chatStream = try await completionService.generateChatCompletion(
+            model: model,
+            messages: messages,
+            temperature: temperature,
+            stream: true
+        )
+        
+        // Collect response
+        var responseText = ""
+        for await chunk in chatStream {
+            responseText += chunk.content
+        }
+        
+        return responseText
     }
-
-    /// Analyzes a command result and generates feedback
-    /// - Parameter result: Result of command execution
-    /// - Returns: Command suggestions and context based on result
-    private func analyzeCommandResult(_ result: CommandResult) async throws -> (
-        suggestions: [CommandSuggestion], context: String?
-    ) {
-        // TODO: Implement AI-based result analysis
-        // For now, implement a simple pattern-matching approach
-
-        // Check for error code
-        if result.exitCode != 0 {
-            // Suggest error recovery
-            return (
-                suggestions: [
-                    CommandSuggestion(
-                        command: "echo $?",
-                        explanation: "Display the exit code of the previous command",
-                        safetyLevel: .safe
-                    )
-                ],
-                context: "The command failed with exit code \(result.exitCode)"
-            )
+    
+    /// Parses the AI suggestion response into structured suggestions
+    /// - Parameters:
+    ///   - response: The raw AI response
+    ///   - priority: Priority level for the suggestions
+    /// - Returns: Structured suggestions as an AIModeResponse
+    private func parseSuggestionResponse(
+        _ response: String,
+        priority: SuggestionPriority
+    ) async throws -> AIModeResponse {
+        // Preprocess the response to ensure it's in a parseable format
+        let processedResponse = await parsingService.preprocessResponse(response)
+        
+        // Check for "NO_SUGGESTIONS" response
+        if processedResponse.contains("NO_SUGGESTIONS") {
+            return AIModeResponse()
         }
-
-        // Check for git commands
-        if result.command.hasPrefix("git") {
-            return (
-                suggestions: [
-                    CommandSuggestion(
-                        command: "git log --oneline -n 5",
-                        explanation: "Show recent commit history",
-                        safetyLevel: .safe
-                    )
-                ],
-                context: "Git command completed successfully"
-            )
-        }
-
-        // Default analysis
-        return (
-            suggestions: [],
-            context: "Command completed successfully"
+        
+        // Extract suggestions using the parsing service
+        let suggestions = try await parsingService.parseSuggestions(from: processedResponse)
+        
+        // Apply safety considerations based on priority
+        let processedSuggestions = await processSuggestionsForSafety(suggestions, priority: priority)
+        
+        // Create response with suggestions
+        return AIModeResponse(
+            suggestions: processedSuggestions,
+            context: extractContextForUser(from: processedResponse)
         )
     }
+    
+    /// Processes suggestions for safety and confirmation requirements
+    /// - Parameters:
+    ///   - suggestions: Raw suggestions from the AI
+    ///   - priority: Priority level of the suggestions
+    /// - Returns: Processed suggestions with proper safety flags
+    private func processSuggestionsForSafety(
+        _ suggestions: [CommandSuggestion],
+        priority: SuggestionPriority
+    ) async -> [CommandSuggestion] {
+        var processedSuggestions: [CommandSuggestion] = []
+        
+        for suggestion in suggestions {
+            // Skip empty suggestions
+            guard !suggestion.command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                continue
+            }
+            
+            // Check if command requires confirmation
+            let requiresConfirmation = suggestion.safetyLevel == .destructive || 
+                                       suggestion.safetyLevel == .moderate ||
+                                       await parsingService.requiresConfirmation(suggestion.command)
+            
+            // Create processed suggestion
+            let processedSuggestion = CommandSuggestion(
+                command: suggestion.command,
+                explanation: suggestion.explanation,
+                safetyLevel: suggestion.safetyLevel,
+                requiresConfirmation: requiresConfirmation
+            )
+            
+            processedSuggestions.append(processedSuggestion)
+        }
+        
+        return processedSuggestions
+    }
+    
+    /// Extracts contextual information for the user from the AI response
+    /// - Parameter response: The raw AI response
+    /// - Returns: Extracted context or nil if none found
+    private func extractContextForUser(from response: String) -> String? {
+        // Look for explicit ERROR ANALYSIS section
+        if let analysisRange = response.range(of: "ERROR ANALYSIS:.*?(?=SUGGESTIONS|$)", options: .regularExpression) {
+            let analysis = response[analysisRange]
+                .replacingOccurrences(of: "ERROR ANALYSIS:", with: "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            
+            if !analysis.isEmpty {
+                return analysis
+            }
+        }
+        
+        // Look for any contextual information outside the suggestion format
+        let suggestionsPattern = "SUGGESTIONS:.*?END SUGGESTIONS"
+        if let cleanedResponse = response.range(of: suggestionsPattern, options: [.regularExpression, .dotMatchesLineSeparators]) {
+            let contextText = response.replacingOccurrences(of: response[cleanedResponse], with: "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            
+            if !contextText.isEmpty {
+                return contextText
+            }
+        }
+        
+        return nil
+    }
+    
+    // Using SuggestionPriority from CommandPatternDetector.swift
 }
