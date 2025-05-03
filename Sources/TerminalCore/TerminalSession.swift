@@ -2,63 +2,336 @@ import AIIntegration
 import Combine
 import Darwin  // For ioctl and winsize
 import Foundation
-import SwiftTerm
+@preconcurrency import SwiftTerm
+import AppKit
+import os.log
+import SharedModels
 
-@MainActor public class TerminalSession: ObservableObject, @preconcurrency LocalProcessDelegate, TerminalViewDelegate {
-    @Published public var isRunning: Bool = false
-    @Published public var lastOutput: String = ""
-    @Published public var currentWorkingDirectory: String?
-
-    // Terminal dimensions
-    @Published public private(set) var currentCols: Int = 80
-    @Published public private(set) var currentRows: Int = 25
-
-    // Syntax highlighting
-    @Published public private(set) var currentTheme: HighlightTheme
-    @Published public var syntaxHighlightingEnabled: Bool = true
-
-    // AI Integration
-    @Published public private(set) var aiCoordinator: AITerminalCoordinator
-    @Published public private(set) var aiEnabled: Bool = true
-    @Published public private(set) var aiMode: AIMode = .disabled
-    @Published public private(set) var currentAIModel: AIModel?
-    @Published public private(set) var availableModels: [AIModel] = []
-    @Published public private(set) var aiSuggestions: [CommandSuggestion] = []
-    @Published public private(set) var isProcessingAI: Bool = false
-    @Published public private(set) var lastAIContext: String?
-
-    // SwiftTerm Integration
-    weak var terminalView: SwiftTerm.TerminalView?
-    private var localProcess: SwiftTerm.LocalProcess?
-
-    // Shell configuration
-    // Use interactive login shell to ensure proper environment setup
-    private let shell: String = "/bin/zsh"
-    private let shellArgs: [String] = ["-i", "-l"]  // Interactive and login shell
-
-    // Buffer for typed commands before sending (if needed by UI)
-    var commandBuffer: String = ""
+/// Security context for command execution
+public struct SecurityContext {
+    let level: CommandSandbox.SecurityLevel
+    let isAIGenerated: Bool
+    let timestamp: Date
+    var violations: [String]
+    var lastCheck: Date
     
-    // Input handling flags
-    private var isHandlingInput = false
-    private var pendingInput = Data()
+    var asDictionary: [String: String] {
+        [
+            "level": String(describing: level),
+            "isAIGenerated": String(isAIGenerated),
+            "timestamp": String(describing: timestamp),
+            "violations": violations.joined(separator: ","),
+            "lastCheck": String(describing: lastCheck)
+        ]
+    }
+}
 
-    // Removed duplicate process property since localProcess is the actual instance used
+/// Security manager for terminal operations
+@MainActor public class TerminalSecurityManager {
+    /// Logger for security events
+    private let logger = Logger(subsystem: "com.llamaterminal", category: "SecurityManager")
+    
+    /// Last security check timestamp
+    private var lastCheck: Date = Date()
+    
+    /// Security violations detected in this session
+    private var violations: [SecurityViolation] = []
+    
+    /// A security violation record
+    struct SecurityViolation {
+        let timestamp: Date
+        let command: String
+        let reason: String
+        let level: CommandSandbox.SecurityLevel
+        let isAIGenerated: Bool
+    }
+    
+    /// Initialize the security manager
+    init() {
+        logger.info("Terminal security manager initialized")
+    }
+    
+    /// Get current security context
+    func executeCommandWithValidation(
+        command: String,
+        isAIGenerated: Bool = false,
+        taskId: UUID = UUID()
+    ) async {
+        // First update task state to in-progress
+        await taskPersistenceManager.startTask(taskId, command: command, isAIGenerated: isAIGenerated)
+        
+        // Validate command for security concerns
+        if let validationError = await securityValidator.validateCommand(command, isAIGenerated: isAIGenerated) {
+            // Handle security validation failure
+            await handleCommandFailure(
+                taskId: taskId,
+                error: validationError,
+                errorMessage: "Security validation failed",
+                logMessage: "Security validation failed for command: \(command), error: \(validationError)",
+                command: command,
+                isAIGenerated: isAIGenerated,
+                securityEventType: "command_rejected"
+            )
+            return
+        }
+        
+        // Begin sandboxing if validation passes
+        do {
+            let sandboxedCommand = try await commandSandboxer.sandboxCommand(command)
+            
+            // Execute the sandboxed command
+            do {
+                // Send the command to the process
+                try await process.send(text: sandboxedCommand + "\n")
+                
+                // Update history after successful execution
+                await commandHistoryManager.addCommandToHistory(CommandHistoryEntry(
+                    command: command,
+                    timestamp: Date(),
+                    isAIGenerated: isAIGenerated
+                ))
+                
+                // Mark task as completed
+                await taskPersistenceManager.completeTask(taskId)
+            } catch {
+                await handleCommandFailure(
+                    taskId: taskId,
+                    error: error,
+                    errorMessage: "Failed to execute command",
+                    logMessage: "Failed to execute command: \(command), error: \(error)",
+                    command: command,
+                    isAIGenerated: isAIGenerated,
+                    securityEventType: "command_execution_failed"
+                )
+            }
+        } catch {
+            // Handle sandboxing failure
+            await handleCommandFailure(
+                taskId: taskId,
+                error: error,
+                errorMessage: "Command sandboxing failed",
+                logMessage: "Sandboxing failed for command: \(command), error: \(error)",
+                command: command,
+                isAIGenerated: isAIGenerated,
+                securityEventType: "sandboxing_failed"
+            )
+        }
+    }
+    /// Whether syntax highlighting is enabled
+    @Published @MainActor public var syntaxHighlightingEnabled: Bool = true
+    
+    /// Current theme
+    @Published @MainActor public private(set) var currentTheme: HighlightTheme
+    
+    /// AI terminal coordinator
+    private let aiCoordinator: AITerminalCoordinator
+    
+    /// AI mode
+    @Published public private(set) var aiMode: AIMode = .disabled
+    
+    /// AI model
+    @Published public private(set) var currentAIModel: AIModel?
+    
+    /// Available AI models
+    @Published public private(set) var availableModels: [AIModel] = []
+    
+    /// AI enabled
+    @Published public private(set) var aiEnabled: Bool = false
+    
+    /// AI is processing
+    @Published public private(set) var isProcessingAI: Bool = false
+    
+    /// AI suggestions
+    @Published public private(set) var aiSuggestions: [CommandSuggestion] = []
+    
+    /// Last AI context
+    @Published public private(set) var lastAIContext: String?
+    
+    /// Whether security monitoring is enabled
+    @Published public private(set) var securityMonitoringEnabled: Bool = true
+    
+    /// Command execution service
+    private let commandExecutionService: CommandExecutionService
+    
+    /// Command highlighter
     private let commandHighlighter: ShellCommandHighlighter
+    
+    /// Code highlighter
     private let codeHighlighter: CodeHighlighter
-    private var commandExecutionService: CommandExecutionService
-    private var cancellables = Set<AnyCancellable>()
-
-    public init(theme: HighlightTheme = .dark) {
-        // Initialize currentWorkingDirectory, could fetch from FileManager
+    
+    /// Command sandbox for security
+    private let commandSandbox: CommandSandbox
+    
+    /// Audit logger for security logging
+    private let auditLogger: AuditLogger
+    
+    /// Task persistence manager
+    /// Task persistence manager
+    private let taskPersistenceManager = TaskPersistenceManager.shared
+    
+    /// Logger for terminal session
+    private let logger = Logger(subsystem: "com.llamaterminal", category: "TerminalSession")
+    
+    /// State manager for terminal state
+    private var stateManager: TerminalStateManager!
+    /// Current active tasks
+    @Published public private(set) var activeTasks: [UUID: TaskState] = [:]
+    
+    /// Current recovery tasks
+    @Published public private(set) var recoveryTasks: [TaskState] = []
+    
+    /// Session identifier
+    private let sessionId = UUID()
+    
+    /// Time when session started
+    private let sessionStartTime = Date()
+    
+    /// Current error
+    @Published public private(set) var error: Error?
+    
+    /// Status message
+    @Published public private(set) var statusMessage: String = "Initializing..."
+    
+    /// Terminal-specific error types
+    @MainActor public enum TerminalError: Error, LocalizedError {
+        case processTerminated(_ process: LocalProcess, exitCode: Int32?)
+        case processNotInitialized
+        case processNotRunning
+        case invalidCommand
+        case securityViolation(String)
+        case taskRecoveryFailed(String)
+        case invalidState(String)
+        case sandboxViolation(String)
+        
+        public var errorDescription: String? {
+            switch self {
+            case .processTerminated(_, let exitCode):
+                if let code = exitCode {
+                    return "Terminal process terminated with exit code: \(code)"
+                } else {
+                    return "Terminal process terminated"
+                }
+            case .processNotInitialized:
+                return "Terminal process not initialized"
+            case .processNotRunning:
+                return "Terminal process not running"
+            case .invalidCommand:
+                return "Invalid command format"
+            case .securityViolation(let details):
+                return "Security violation: \(details)"
+            case .taskRecoveryFailed(let reason):
+                return "Task recovery failed: \(reason)"
+            case .invalidState(let details):
+                return "Invalid terminal state: \(details)"
+            case .sandboxViolation(let details):
+                return "Command sandbox violation: \(details)"
+            }
+        }
+    }
+    
+    /// SwiftTerm terminal view reference
+    @MainActor private weak var terminalView: SwiftTerm.TerminalView?
+    
+    /// Process manager for terminal processes
+    private var processManager: ProcessManager?
+    
+    /// Shell executable path
+    private var shell: String = "/bin/zsh"  // Default shell
+    
+    /// Current working directory
+    private var currentWorkingDirectory: String?
+    
+    /// Last time we saved session state
+    private var lastSessionStateSave: Date?
+    
+    /// Local process for terminal
+    private var localProcess: LocalProcess?
+    
+    /// Security manager for enhanced terminal security
+    private let securityManager = TerminalSecurityManager()
+    
+    /// Recovery context for task preservation
+    private var recoveryContext: [String: Any] = [:]
+    
+    /// Last security event timestamp
+    private var lastSecurityEvent: Date?
+    
+    /// Command history with enhanced tracking
+    private var commandHistory: [CommandHistoryEntry] = []
+    
+    /// Current terminal dimensions
+    private var currentCols: Int = 80
+    private var currentRows: Int = 25
+    
+    /// Whether the terminal process is running
+    @Published public private(set) var isRunning: Bool = false
+    
+    /// Last output received from the terminal
+    @Published public private(set) var lastOutput: String = ""
+    
+    /// Window manager for terminal windows
+    private var windowManager: TerminalWindowManager!
+    
+    /// Input handler for terminal input
+    private var inputHandler: TerminalInputHandler!
+    
+    /// Output handler for terminal output
+    private var outputHandler: TerminalOutputHandler!
+    
+    /// Terminal configuration
+    private var terminalConfiguration: TerminalConfiguration!
+    
+    /// Command sandboxer for security
+    private var commandSandboxer: CommandSandbox!
+    
+    /// Security validator for command security
+    private var securityValidator: CommandSecurityValidator!
+    // MARK: - Initialization
+    
+    @MainActor public init(theme: HighlightTheme = .dark) {
+        print("[TerminalSession] Initializing with theme: \(theme.name)")
+        
+        // Initialize basic properties
         self.currentWorkingDirectory = FileManager.default.currentDirectoryPath
         self.currentTheme = theme
+        
+        // Initialize highlighters
         self.commandHighlighter = ShellCommandHighlighter()
         self.codeHighlighter = CodeHighlighter()
+        
+        // Initialize AI coordinator
         self.aiCoordinator = AITerminalCoordinator()
+        
+        // Initialize command execution service
         self.commandExecutionService = CommandExecutionService()
-
-        // Set up safety confirmation handler
+        
+        // Initialize security components
+        self.commandSandboxer = DefaultCommandSandbox()
+        self.securityValidator = DefaultCommandSecurityValidator()
+        
+        // Initialize components in correct order
+        self.terminalConfiguration = DefaultTerminalConfiguration()
+        self.windowManager = DefaultTerminalWindowManager(terminalConfiguration: terminalConfiguration)
+        self.inputHandler = DefaultTerminalInputHandler(windowManager: windowManager)
+        self.outputHandler = DefaultTerminalOutputHandler()
+        self.stateManager = DefaultTerminalStateManager()
+        
+        // Set up delegates
+        self.windowManager.configurationDelegate = self
+        self.terminalConfiguration.shellCommandDelegate = self
+        self.outputHandler.outputProcessingDelegate = self
+        
+        // Set up initial state
+        self.stateManager.updateState(TerminalState(
+            isRunning: false,
+            currentWorkingDirectory: self.currentWorkingDirectory,
+            cols: self.currentCols,
+            rows: self.currentRows,
+            syntaxHighlightingEnabled: self.syntaxHighlightingEnabled,
+            theme: self.currentTheme
+        ))
+        
+        // Set up safety confirmation handler for AI
         Task {
             await self.aiCoordinator.setSafetyConfirmationHandler {
                 @Sendable
@@ -74,62 +347,11 @@ import SwiftTerm
         }
     }  // End of init method
 
-    /// Ensures that the terminal window is active and focused
-    /// Consolidates window activation logic in one place
-    private func ensureWindowActive() {
-        guard let view = terminalView,
-              let window = view.window else { return }
-        
-        // For window activation, we need to do everything on the main thread
-        if !Thread.isMainThread {
-            DispatchQueue.main.sync { [weak self] in
-                self?.ensureWindowActive()
-            }
-            return
-        }
-        
-        // Check current window and responder state
-        let needsActivation = !window.isKeyWindow || window.firstResponder !== view
-        
-        if needsActivation {
-            print("[TerminalSession] Window activation needed")
-            
-            // First, ensure window is visible and key
-            window.makeKeyAndOrderFront(nil)
-            
-            // Then set first responder
-            if window.firstResponder !== view {
-                print("[TerminalSession] Setting first responder to terminal view")
-                window.makeFirstResponder(view)
-                view.becomeFirstResponder()
-            }
-            
-            // Force cursor visibility and state refresh after activation
-            let refreshSequence = [
-                "\u{1b}[?25h",    // Show cursor
-                "\u{1b}[?12l",    // Disable local echo
-                "\u{1b}[4l",      // Reset insert mode
-            ].joined()
-            view.feed(txt: refreshSequence)
-            
-            // Give a moment for activation to take effect, then verify again
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
-                guard let self = self else { return }
-                
-                if !window.isKeyWindow || window.firstResponder !== view {
-                    print("[TerminalSession] Window activation verification failed, retrying")
-                    window.makeKeyAndOrderFront(nil)
-                    window.makeFirstResponder(view)
-                    view.becomeFirstResponder()
-                    self.refreshTerminalState()
-                }
-            }
-        }
-    }
+    
+    // MARK: - Terminal View Management
     
     /// Ensures the terminal view has proper focus
-    /// Ensures the terminal view has proper focus - REMOVED, use ensureWindowActive instead
-    private func refreshTerminalState() {
+    public func refreshTerminalState() {
         guard let view = terminalView else { return }
         
         print("[TerminalSession] Refreshing terminal state...")
@@ -143,22 +365,22 @@ import SwiftTerm
             "\u{1b}[?12l",    // Disable local echo (crucial for proper echo behavior)
             "\u{1b}[4l",      // Reset insert mode (crucial for proper cursor behavior)
             "\u{1b}[20h",     // Set newline mode (LNM)
-            "\u{1b}]0;LlamaTerminal\u{7}", // Reset window title (helps with focus issues)
+            "\u{1b}]0;LlamaTerminal\u{7}" // Reset window title (helps with focus issues)
         ].joined()
         
         // Set proper terminal options through the terminal object if available
-        if let terminal = view.getTerminal() {
+        if let terminal = view.terminal {
             // These options are crucial for proper terminal behavior
-            terminal.setOption(.cursorVisible, true)
-            terminal.setOption(.cursorBlink, true)
-            terminal.setOption(.bracketedPasteMode, true)
-            terminal.setOption(.altSendsEscape, true)   // Ensure Alt/Meta keys work properly
-            terminal.setOption(.allowMouseReporting, true) // Make mouse clicks work in apps like vim
+            if let options = terminal.options {
+                options.insert(.cursorBlink)
+                options.insert(.cursorVisible)
+                options.insert(.bracketedPaste)
+                options.insert(.allowMouseReporting)
+            }
         }
-        
         // Send control sequences to terminal
         print("[TerminalSession] Sending terminal control sequences")
-        view.feed(txt: refreshSequence)
+        view.feed(text: refreshSequence)
         
         // If we have a running process, also send some stty commands to ensure proper echo
         if isRunning, let proc = localProcess {
@@ -192,60 +414,53 @@ import SwiftTerm
         print("[TerminalSession] Initializing terminal view")
         self.terminalView = view
         
-        // Set delegate
-        view.delegate = self
-        
-        // Configure terminal view colors first
+        // Configure colors
         view.configureNativeColors()
-        view.installColors(.defaultDark)
         
-        // Clear screen and ensure clean state before any other initialization
-        view.feed(txt: "\u{1b}[2J\u{1b}[H")  // Clear screen and home cursor
-        Thread.sleep(forTimeInterval: 0.05)  // Brief pause
+        // Clear screen and ensure clean state
+        view.feed(text: "\u{1b}[2J\u{1b}[H")  // Clear screen and home cursor
         
-        // Initialize terminal size
-        if let size = view.getOptimalTtySize() {
-            self.currentCols = size.cols > 0 ? Int(size.cols) : 80
-            self.currentRows = size.rows > 0 ? Int(size.rows) : 25
-        }
-        
-        // Perform basic initialization immediately
-        if let terminal = view.getTerminal() {
+        // Set initial size
+        self.currentCols = 80
+        self.currentRows = 25
+        // Initialize terminal with options
+        if let terminal = view.terminal {
             terminal.resetToInitialState()
-            terminal.setOption(.cursorVisible, true)
-            terminal.setOption(.cursorBlink, true)
-            terminal.setOption(.bracketedPasteMode, true)
-            terminal.setEncoding(.utf8)
+            if let options = terminal.options {
+                options.insert(.allowMouseReporting)
+                options.insert(.bracketedPaste)
+                options.insert(.cursorBlink)
+                options.insert(.cursorVisible)
+            }
         }
+        
         
         // Set initial window state
         if let window = view.window {
             DispatchQueue.main.sync {
-                window.makeKeyAndOrderFront(nil)
+                window.makeKeyAndOrderFront(self)
                 window.makeFirstResponder(view)
-                view.becomeFirstResponder()
+                let _ = view.becomeFirstResponder()
             }
         }
     }
     
     /// Performs a thorough terminal reset and initialization
-    /// Performs a thorough terminal reset and initialization
     private func performFullTerminalReset(_ view: SwiftTerm.TerminalView) {
         print("[TerminalSession] Performing full terminal reset sequence")
         
         // First, use the SwiftTerm built-in reset capabilities
-        if let terminal = view.getTerminal() {
+        if let terminal = view.terminal {
             terminal.resetToInitialState()
             
             // Set essential terminal options
-            terminal.setOption(.allowMouseReporting, true)
-            terminal.setOption(.bracketedPasteMode, true)
-            terminal.setOption(.cursorBlink, true)
-            terminal.setOption(.cursorVisible, true)
-            terminal.setEncoding(.utf8)
+            if let options = terminal.options {
+                options.insert(.cursorBlink)
+                options.insert(.cursorVisible)
+                options.insert(.bracketedPaste)
+                options.insert(.allowMouseReporting)
+            }
         }
-        
-        // Apply single, consolidated reset sequence in proper order
         // The order of these commands is critical for proper terminal behavior
         let resetSequence = [
             "\u{1b}c",         // RIS - Full terminal reset
@@ -263,242 +478,329 @@ import SwiftTerm
         ].joined()
         
         // Send the reset sequence
-        view.feed(txt: resetSequence)
+        view.feed(text: resetSequence)
         
         // Give terminal a moment to process, then clear screen once more
-        Thread.sleep(forTimeInterval: 0.05)
-        view.feed(txt: "\u{1b}[2J\u{1b}[H\u{1b}[?25h") // Clear, home cursor, and show cursor
     }
     
+    // MARK: - TerminalSessionProtocol Methods
+    
+    /// Starts a new terminal session
+    /// - Parameter terminalView: Terminal view to attach to
     @MainActor public func startSession(terminalView: SwiftTerm.TerminalView) async {
-        print("[TerminalSession] startSession called.")
+        logger.info("Starting new terminal session \(sessionId.uuidString)")
         
-        // Reset state
-        self.isRunning = false
-        self.pendingInput = Data()
-        self.isHandlingInput = false
-        self.lastOutput = ""
+        // Reset component state
+        resetAllComponents()
         
-        // STEP 1: Initialize terminal view first with proper setup
-        // Initialize the terminal view before anything else to ensure proper setup
-        initializeTerminalView(terminalView)
+        // Save terminal view reference
+        self.terminalView = terminalView
         
-        // STEP 2: Ensure window activation - CRITICAL for preventing input echo issues
-        if let view = terminalView, let window = view.window {
-            print("[TerminalSession] Activating window before process start")
-            
-            // Use synchronous activation to ensure proper window focus
-            DispatchQueue.main.sync {
-                // First, ensure window is ordered front
-                window.makeKeyAndOrderFront(nil)
-                Thread.sleep(forTimeInterval: 0.05) // Brief pause for window operation
-                
-                // Then set focus
-                window.makeFirstResponder(view)
-                view.becomeFirstResponder()
-            }
-            
-            // Wait for window activation to take effect
-            Thread.sleep(forTimeInterval: 0.1)
-        }
+        // Set up terminal view delegate
+        terminalView.delegate = self
         
-        // STEP 3: Initialize LocalProcess with proper PTY configuration
-        self.localProcess = SwiftTerm.LocalProcess(delegate: self)
-        guard let localProcess = self.localProcess else {
-            print("[TerminalSession] Error: Failed to create LocalProcess.")
+        // Check for recovery tasks
+        await checkForRecoveryTasks()
+        
+        // STEP 1: Initialize terminal view with proper configuration
+        terminalConfiguration.initializeTerminal(terminalView: terminalView)
+        
+        // STEP 2: Set up input handler with terminal view
+        inputHandler.setTerminalView(terminalView)
+        
+        // STEP 3: Ensure window has focus
+        windowManager.activateWindow(terminalView: terminalView)
+        
+        // Wait for window activation to take effect
+        try? await Task.sleep(for: .milliseconds(100))
+        
+        // STEP 4: Initialize process management
+        do {
+            try await initializeProcessManagement(for: terminalView)
+        } catch {
+            print("[TerminalSession] Error initializing process: \(error.localizedDescription)")
             
             // Display error in terminal view
-            if let view = self.terminalView {
-                view.feed(txt: "\r\nFailed to initialize terminal process. Please restart the application.\r\n")
-            }
-            
-            self.lastOutput = "Failed to initialize terminal process handler."
+            terminalView.feed(text: "\r\nFailed to initialize terminal process: \(error.localizedDescription)\r\n")
+            self.lastOutput = "Failed to initialize terminal process: \(error.localizedDescription)"
             return
         }
+
+        // STEP 5: Configure terminal and initialize process
+        await configureTerminalForProcess(terminalView)
+    }
+    
+    /// Configures the terminal for process
+    /// - Parameter terminalView: Terminal view to configure
+    @MainActor private func configureTerminalForProcess(_ terminalView: SwiftTerm.TerminalView) async {
+        // Initialize terminal view with proper settings
+        performFullTerminalReset(terminalView)
         
-        // STEP 4: Set up environment variables
-        var environment = ProcessInfo.processInfo.environment
-        // Terminal behavior variables
-        environment["TERM"] = "xterm-256color"
-        environment["TERMINFO"] = "/usr/share/terminfo"
-        environment["COLORTERM"] = "truecolor"
-        environment["INSIDE_LLAMA_TERMINAL"] = "1"
+        // Ensure proper focus
+        ensureWindowActive()
         
-        // Colors and display variables
-        environment["CLICOLOR"] = "1"
-        environment["CLICOLOR_FORCE"] = "1"
+        // Set up any additional terminal-specific configurations
+        terminalConfiguration.configureTerminal(terminalView: terminalView)
         
-        // Shell variables
-        environment["SHELL"] = shell
-        environment["PATH"] = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-        environment["HOME"] = ProcessInfo.processInfo.environment["HOME"]
-        environment["USER"] = ProcessInfo.processInfo.environment["USER"]
-        environment["LOGNAME"] = ProcessInfo.processInfo.environment["USER"]
-        environment["PWD"] = FileManager.default.currentDirectoryPath
+        // Additional setup code as needed
+        refreshTerminalState()
+    }
+    
+    /// Initializes process management components
+    /// - Parameter terminalView: The terminal view to attach to
+    /// - Throws: Any error encountered during process initialization
+    @MainActor private func initializeProcessManagement(for terminalView: SwiftTerm.TerminalView) throws {
+        // Initialize process management
+        let shell = self.shell
+        let workingDir = self.currentWorkingDirectory ?? FileManager.default.currentDirectoryPath
         
-        // Let shell handle its own initialization (don't override PS1)
-        environment.removeValue(forKey: "ZDOTDIR")
-        environment.removeValue(forKey: "PS1")
-        
-        // Convert environment to string array
-        let envStrings = environment.map { "\($0.key)=\($0.value)" }
-        
-        // STEP 5: Final verification of window and terminal state before process start
-        if let view = terminalView, let window = view.window {
-            // One last check to ensure the window is active and view is first responder
-            if !window.isKeyWindow || window.firstResponder !== view {
-                print("[TerminalSession] Window not properly activated, forcing activation")
-                DispatchQueue.main.sync {
-                    window.makeKeyAndOrderFront(nil)
-                    window.makeFirstResponder(view)
-                    view.becomeFirstResponder()
-                }
-            }
-            
-            // Consolidated terminal initialization before process start
-            print("[TerminalSession] Performing final terminal reset before process start")
-            
-            // Perform complete terminal reset with a clean slate
-            performFullTerminalReset(view)
-            
-            // Ensure window is active before starting process (critical for input focus)
-            print("[TerminalSession] Final window activation before process start")
-            DispatchQueue.main.sync {
-                window.makeKeyAndOrderFront(nil)
-                window.makeFirstResponder(view)
-                view.becomeFirstResponder()
-            }
-            // Give time for activation to take effect
-            Thread.sleep(forTimeInterval: 0.1)
+        // Create the process manager if needed
+        if processManager == nil {
+            processManager = ProcessManager()
         }
         
-        // STEP 6: Start the process with proper error handling
-        do {
-            // Start the process with environment and shell args
-            print("[TerminalSession] Starting LocalProcess with command: \(shell) \(shellArgs.joined(separator: " "))")
-            try localProcess.startProcess(
-                executable: self.shell,
-                args: shellArgs,
-                environment: envStrings,
-                cols: UInt16(self.currentCols),    // Add current size
-                rows: UInt16(self.currentRows)     // Add current size
-            )
-            
-            // Mark as running only after process starts successfully
-            self.isRunning = true
-            
-            // Process started successfully - no need to immediately force activation
-            // The terminal is already properly initialized and focused
-        } catch {
-            print("[TerminalSession] Error starting process: \(error.localizedDescription)")
-            
-            if let view = self.terminalView {
-                view.feed(txt: "\r\nError starting terminal process: \(error.localizedDescription)\r\n")
-            }
-            
-            self.lastOutput = "Failed to start terminal process: \(error.localizedDescription)"
-            return
-        }
+        // Create and start the process
+        logger.info("Initializing terminal process with shell: \(shell)")
+        let process = LocalProcess(shellPath: shell, 
+                                   workingDirectory: workingDir,
+                                   environment: ProcessInfo.processInfo.environment)
         
+        // Set up process size
+        process.setSize(rows: UInt16(currentRows), cols: UInt16(currentCols))
+        
+        // Store the process
+        self.localProcess = process
+        
+        // Set us as the delegate
+        process.delegate = self
+        
+        // Start the process
+        try process.start()
+        
+        // Mark as running
+        isRunning = true
         // Configure terminal with minimal settings in a separate task
+        // Configure terminal with essential settings in a separate task
         Task {
-            do {
-                // Give the process time to start before sending any commands
-                // This delay is crucial for proper echo behavior
-                try await Task.sleep(nanoseconds: 500_000_000)  // 500ms delay
-                
-                // Set basic terminal options with better defaults for input echo
-                // Break these into stages for better reliability
-                
-                // Stage 1: Basic TTY configuration
-                let initCommands1 = [
-                    "stty sane",                  // Reset to sane terminal settings (primary reset)
-                    "sleep 0.1",                  // Brief pause for settings to take effect
-                    "stty echo",                  // Ensure echo is on (basic setting)
-                    "stty icrnl onlcr",           // Handle line endings (crucial for proper display)
-                ]
-                
-                // Stage 2: Enhanced TTY settings
-                let initCommands2 = [
-                    "stty echoe echok echoke",    // Enhanced echo control options
-                    "stty icanon",                // Enable canonical mode
-                    "stty erase '^?'",            // Set erase character
-                    "stty intr '^C'",             // Set interrupt character
-                    "stty isig",                  // Enable signals
-                    "stty ixon",                  // Enable flow control
-                ]
-                
-                // Stage 3: Additional optimization
-                let initCommands3 = [
-                    "stty susp '^Z'",             // Set suspend character
-                    "stty werase '^W'",           // Set word erase
-                    "stty kill '^U'",             // Set line kill
-                    "stty -tostop",               // Prevent background processes from stopping on output
-                    "stty -echoctl",              // Don't echo control characters as ^X
-                    // Configure shell
-                    "bindkey -e",                 // Emacs key bindings
-                    "setopt PROMPT_SUBST",        // Enable prompt substitution
-                    "setopt INTERACTIVE_COMMENTS", // Allow comments
-                    "export TERM=xterm-256color", // Ensure terminal type is set properly
-                ]
-                
-                // Send commands in stages with proper error handling
-                async let stage1 = self.sendCommands(initCommands1, delay: 100_000_000)  // 100ms delay
-                await stage1
-                
-                async let stage2 = self.sendCommands(initCommands2, delay: 75_000_000)   // 75ms delay
-                await stage2
-                
-                async let stage3 = self.sendCommands(initCommands3, delay: 50_000_000)   // 50ms delay
-                await stage3
-                
-                // Final window activation after all initialization
-                try await Task.sleep(nanoseconds: 200_000_000)  // 200ms delay for everything to settle
-                
-                // Only refresh the state if needed, don't force activation
-                await MainActor.run {
-                    if let view = self.terminalView, let window = view.window {
-                        // Only activate if not already active
-                        if !window.isKeyWindow || window.firstResponder !== view {
-                            // Force refresh before activation for best results
-                            view.feed(txt: "\u{1b}[?25h") // Just ensure cursor is visible
-                            self.ensureWindowActive()
+            // Helper function to safely send commands with validation and retries
+            func sendSetupCommands(_ commands: [String], delay: UInt64 = 100_000_000, retries: Int = 3) async throws {
+                for command in commands {
+                    var attempts = 0
+                    var success = false
+                    
+                    while attempts < retries && !success {
+                        do {
+                            if let proc = self.localProcess, self.isRunning {
+                                // Validate command before sending
+                                guard command.allSatisfies({ $0.isASCII }) else {
+                                    throw TerminalError.invalidCommand
+                                }
+                                
+                                // Send command with proper line ending
+                                proc.send(data: ArraySlice((command + "\n").utf8))
+                                
+                                // Wait for command to take effect
+                                try await Task.sleep(nanoseconds: delay)
+                                success = true
+                            } else {
+                                throw TerminalError.processNotRunning
+                            }
+                        } catch {
+                            attempts += 1
+                            if attempts >= retries {
+                                logger.error("Failed to execute setup command after \(retries) attempts: \(command)")
+                                throw error
+                            }
+                            // Exponential backoff for retries
+                            try await Task.sleep(nanoseconds: UInt64(pow(2.0, Double(attempts))) * 100_000_000)
                         }
                     }
                 }
-                
-                // Initialize AI features after terminal is fully configured - removed duplicate call
-                // The initialization is already done at startup
-            } catch {
-                print("[TerminalSession] Error during terminal configuration: \(error)")
             }
-        } // End of Task block
+            
+            do {
+                // Wait for process to be fully started
+                try await Task.sleep(nanoseconds: 500_000_000)  // 500ms initial delay
+                
+                // Define command sets with proper grouping and dependencies
+                let terminalResetCommands = [
+                    "stty sane",              // Primary terminal reset
+                    "stty -echo",             // Temporarily disable echo for clean setup
+                ]
+                
+                let basicSetupCommands = [
+                    "stty echo",              // Re-enable echo
+                    "stty icrnl onlcr",       // Handle line endings
+                    "stty icanon",            // Enable canonical mode
+                    "stty isig",              // Enable signals
+                    "stty ixon",              // Enable flow control
+                ]
+                
+                let advancedSetupCommands = [
+                    "stty echoe echok echoke", // Enhanced echo control
+                    "stty erase '^?'",         // Set erase character
+                    "stty intr '^C'",          // Set interrupt character
+                    "stty susp '^Z'",          // Set suspend character
+                    "stty werase '^W'",        // Set word erase
+                    "stty kill '^U'",          // Set line kill
+                    "stty -tostop",            // Prevent background process stopping
+                    "stty -echoctl",           // Don't echo control chars
+                ]
+                
+                let shellOptimizationCommands = [
+                    "bindkey -e",                 // Emacs key bindings
+                    "setopt PROMPT_SUBST",        // Enable prompt substitution
+                    "setopt INTERACTIVE_COMMENTS", // Allow comments
+                    "export TERM=xterm-256color", // Ensure proper terminal type
+                ]
+                
+                // Execute command groups with appropriate delays and error handling
+                logger.info("Initializing terminal with basic settings")
+                try await sendSetupCommands(terminalResetCommands, delay: 200_000_000)
+                
+                logger.info("Configuring basic terminal functionality")
+                try await sendSetupCommands(basicSetupCommands, delay: 100_000_000)
+                
+                logger.info("Applying advanced terminal settings")
+                try await sendSetupCommands(advancedSetupCommands, delay: 75_000_000)
+                
+                logger.info("Optimizing shell environment")
+                try await sendSetupCommands(shellOptimizationCommands, delay: 50_000_000)
+                
+                // Final delay for settings to take effect
+                try await Task.sleep(nanoseconds: 200_000_000)
+                
+                // Ensure window activation only if needed
+                await MainActor.run {
+                    if let view = self.terminalView,
+                       let window = view.window,
+                       !window.isKeyWindow || window.firstResponder !== view {
+                        view.feed(text: "\u{1b}[?25h")  // Ensure cursor is visible
+                        self.ensureWindowActive()
+                    }
+                }
+                
+                logger.info("Terminal initialization completed successfully")
+                
+            } catch {
+                logger.error("Error during terminal configuration: \(error)")
+                
+                // Attempt basic recovery
+                if let proc = self.localProcess, self.isRunning {
+                    // Send minimal safe configuration
+                    proc.send(data: ArraySlice("stty sane\n".utf8))
+                    proc.send(data: ArraySlice("stty echo\n".utf8))
+                }
+                
+                await MainActor.run {
+                    if let view = self.terminalView {
+                        view.feed(text: "\r\n\u{1b}[31mWarning: Some terminal settings may not be optimal\u{1b}[0m\r\n")
+                    }
+                }
+            }
+        }  // End of Task block
     }  // End of startSession function
     
-    /// Helper to send a batch of shell commands with proper error handling
-    private func sendCommands(_ commands: [String], delay: UInt64) async {
-        for cmd in commands {
-            guard self.isRunning, let proc = self.localProcess else {
-                print("[TerminalSession] Process not available for command: \(cmd)")
-                break
+    /// Helper to send a command string to the process with security validation
+    public func sendCommandToProcess(_ command: String) {
+        let commandWithNewline = command + "\n"
+        
+        // Create a task ID for tracking
+        let taskId = UUID()
+        
+        // Log the command execution intention
+        Task {
+            await auditLogger.logCommandExecution(
+                command: command,
+                isAIGenerated: false,
+                workingDirectory: currentWorkingDirectory
+            )
+            
+            // Save command state for potential recovery
+            let taskData = UserCommandData(
+                command: command,
+                workingDirectory: currentWorkingDirectory,
+                environment: nil // Could get from process.environment if needed
+            )
+            
+            let taskState = TaskState(
+                id: taskId,
+                type: .userCommand,
+                description: "Execute command: \(command)",
+                data: taskData,
+                status: .pending
+            )
+            
+            // Save task state
+            let _ = await taskPersistenceManager.saveTaskState(taskState)
+            
+            // Track active task
+            await MainActor.run {
+                activeTasks[taskId] = taskState
+            }
+        }
+        
+        // Apply security checks and sandboxing if enabled
+        if securityMonitoringEnabled {
+            // Determine security level based on AI mode
+            let securityLevel: CommandSandbox.SecurityLevel = 
+                aiMode == .disabled ? .standard : .strict
+            
+            // Sandbox the command
+            guard let sandboxedCommand = commandSandbox.sandboxCommand(
+                command, 
+                securityLevel: securityLevel,
+                isAIGenerated: false
+            ) else {
+                // Command rejected by security sandbox
+                if let view = terminalView {
+                    view.feed(text: "\r\n\u{1b}[31mCommand rejected by security sandbox\u{1b}[0m\r\n")
+                }
+                
+                // Update task status to failed
+                Task {
+                    await taskPersistenceManager.failTask(taskId, error: "Command rejected by security sandbox")
+                    
+                    // Remove from active tasks
+                    await MainActor.run {
+                        activeTasks.removeValue(forKey: taskId)
+                    }
+                }
+                
+                return
             }
             
-            proc.send(data: ArraySlice((cmd + "\n").utf8))
+            // Update task to in-progress
+            Task {
+                await taskPersistenceManager.updateTaskState(taskId) { task in
+                    task.status = .inProgress
+                }
+            }
             
-            // Wait briefly between commands to ensure they're processed correctly
-            do {
-                try await Task.sleep(nanoseconds: delay)
-            } catch {
-                print("[TerminalSession] Error in sleep between commands: \(error.localizedDescription)")
+            // Use sandboxed command instead
+            if let data = (sandboxedCommand + "\n").data(using: .utf8) {
+                sendToProcess(data: ArraySlice(data))
+            }
+        } else {
+            // If security is disabled, send original command
+            if let data = commandWithNewline.data(using: .utf8) {
+                sendToProcess(data: ArraySlice(data))
+            }
+            
+            // Update task to in-progress
+            Task {
+                await taskPersistenceManager.updateTaskState(taskId) { task in
+                    task.status = .inProgress
+                }
             }
         }
     }
-
+    
+    /// Sends data to the process
+    /// - Parameter data: Data to send
     public func sendToProcess(data: ArraySlice<UInt8>) {
-        guard isRunning, let localProcess = self.localProcess else {
-            print(
-                "[TerminalSession] Cannot send data: Session not running or process not initialized."
-            )
+        guard let localProcess = localProcess, isRunning else {
+            print("[TerminalSession] Cannot send to process: process not running")
             return
         }
         
@@ -541,18 +843,17 @@ import SwiftTerm
         
         // Update terminal size
         if let process = localProcess, isRunning {
-            process.resize(rows: UInt16(rows), cols: UInt16(cols))
-            
+            process.setSize(rows: UInt16(rows), cols: UInt16(cols))
             // Send updated size to terminal
             if let view = terminalView {
                 // Update terminal about its new size
                 let sizeSequence = "\u{1b}[8;\(rows);\(cols)t"
-                view.feed(txt: sizeSequence)
+                view.feed(text: sizeSequence)
             }
         }
     }
-    // --- LocalProcessDelegate Methods ---
-
+    // MARK: - LocalProcessDelegate Methods
+    
     @MainActor public func dataReceived(slice: ArraySlice<UInt8>) {
         guard let view = terminalView else {
             print("[TerminalSession] Error: terminalView is nil in dataReceived.")
@@ -565,6 +866,9 @@ import SwiftTerm
         // Process output for AI or logging
         if let output = String(bytes: slice, encoding: .utf8) {
             self.lastOutput = output
+            
+            // Monitor output for command completion
+            checkForCommandCompletion(output)
             
             // Debug print for non-empty visible output
             if !output.isEmpty && output.rangeOfCharacter(from: .whitespaces.inverted) != nil {
@@ -585,6 +889,9 @@ import SwiftTerm
         // Mark session as running if it's not already
         if !isRunning { 
             isRunning = true 
+            
+            // Save initial session state once we're running
+            saveSessionState()
         }
         // Don't force window activation during data receipt - this can cause focus issues
         // and disrupt user interaction with the terminal
@@ -595,78 +902,31 @@ import SwiftTerm
         // This prevents premature "terminal session has ended" messages
         guard isRunning else { return }
         
-        let statusText = exitCode != nil ? "status: \(exitCode!)" : "signal or error"
-        print("[TerminalSession] processTerminated delegate: \(statusText)")
-        
-        // Update state
+        // Mark terminal as not running
         isRunning = false
-        localProcess = nil
         
-        // Keep terminal view active but clear screen
+        // Show termination message in terminal
         if let view = terminalView {
-            // Clear screen and reset cursor
-            view.feed(txt: "\u{1b}[2J\u{1b}[H")
-            
-            // Display termination message
-            let terminationMessage = """
-                \r\n
-                Terminal session ended (\(statusText))
-                Press Enter to start a new session, or use Command+N for a new window.
-                \r\n
-                """
-            view.feed(txt: terminationMessage)
-            
-            // Ensure terminal view remains first responder using our consolidated method
-            ensureWindowActive()
+            let statusMessage: String
+            if let code = exitCode {
+                statusMessage = "\r\n\u{1b}[33mTerminal session has ended (exit code: \(code))\u{1b}[0m\r\n"
+            } else {
+                statusMessage = "\r\n\u{1b}[33mTerminal session has ended\u{1b}[0m\r\n"
+            }
+            view.feed(text: statusMessage)
         }
         
-        // Update last output
-        lastOutput = "Terminal process terminated (\(statusText))"
-    }
-
-    @MainActor public func getWindowSize() -> winsize {
-        // Ensure we never return invalid dimensions
-        let rows = max(UInt16(self.currentRows), 10)
-        let cols = max(UInt16(self.currentCols), 40)
+        // Complete all active tasks
+        completeAllActiveTasks(exitCode: exitCode)
         
-        let ws = winsize(
-            ws_row: rows, 
-            ws_col: cols, 
-            ws_xpixel: 0,
-            ws_ypixel: 0
-        )
+        // Notify the system
+        logger.info("Terminal process terminated with exit code: \(exitCode ?? -1)")
         
-        print("[TerminalSession] getWindowSize delegate reporting: \(ws.ws_col)x\(ws.ws_row)")  // DEBUG
-        return ws
+        // Clean up references
+        localProcess = nil
     }
-
     // MARK: - AI Integration Methods
-
-    /// Initializes AI features by fetching available models
-    private func initializeAIFeatures() async {
-        // Try to initialize the AI coordinator
-        let success = await aiCoordinator.initialize()
-
-        if success {
-            // Update available models
-            self.availableModels = await aiCoordinator.getAvailableModels()
-
-            // Set initial model if available
-            if let model = await aiCoordinator.currentModel {
-                self.currentAIModel = model
-            }
-
-            // Default to Auto mode if a model is available
-            if self.currentAIModel != nil {
-                await setAIMode(.auto)
-            }
-        } else {
-            print("Failed to initialize AI features. Check if Ollama is running.")
-            self.aiEnabled = false
-        }
-    }
-
-    /// Sets the AI mode
+    
     /// - Parameter mode: Mode to set
     public func setAIMode(_ mode: AIMode) async {
         await aiCoordinator.setMode(mode)
@@ -745,32 +1005,32 @@ import SwiftTerm
     }
 
     /// Processes a user command through AI
+    // MARK: - Command Processing
+    
+    /// Processes a user command through AI
     /// - Parameter command: Command to process
     private func processUserCommand(_ command: String) async {
-        guard aiEnabled, aiMode != .disabled else {
+        // Check if AI is disabled
+        guard aiEnabled && aiMode != .disabled else {
             sendCommandToProcess(command)  // Send command directly if AI disabled
             return
         }
-
+        
         self.isProcessingAI = true
-
+        
         do {
             // Process through AI coordinator
-            let response = try await aiCoordinator.processInput(command)
-
-            // Update suggestions
-            await MainActor.run {
-                self.aiSuggestions = response.suggestions
-                if let context = response.context {
-                    self.lastAIContext = context
-                }
+            let response = try await aiCoordinator.processCommand(command)
+            // Update suggestions - no need for MainActor.run since class is @MainActor
+            self.aiSuggestions = response.suggestions
+            if let context = response.context {
+                self.lastAIContext = context
             }
-
-            // If in dispatch mode, execute suggested actions automatically
+ // If in dispatch mode, execute suggested actions automatically
             if aiMode == .dispatch, let firstAction = response.actions.first {
                 // Execute the action if it was approved or doesn't need confirmation
                 let shouldExecute = await aiCoordinator.executeAction(firstAction)
-
+                
                 if shouldExecute {
                     await executeAIAction(firstAction)
                 } else {
@@ -782,18 +1042,14 @@ import SwiftTerm
             }
         } catch {
             // Update error state
-            await MainActor.run {
-                self.lastAIContext = "AI processing error: \(error.localizedDescription)"
-                self.isProcessingAI = false
-            }
-
+            self.lastAIContext = "AI processing error: \(error.localizedDescription)"
+            self.isProcessingAI = false
+            
             // Fall back to sending the original command even on AI error
             sendCommandToProcess(command)
         }
-
-        await MainActor.run {
-            self.isProcessingAI = false
-        }
+        
+        self.isProcessingAI = false
     }
 
     /// Executes an AI action
@@ -1000,75 +1256,770 @@ import SwiftTerm
             }
         }
     }
-
-    /// Executes a suggested command
-    /// - Parameter suggestion: Command suggestion to execute
-    public func executeSuggestion(_ suggestion: CommandSuggestion) {
-        guard isRunning else { return }
-
-        if suggestion.requiresConfirmation {
-            // For now, echo the suggestion and ask for confirmation
-            guard let terminalWrapper = terminalView else { return }
-
-            let safetyIndicator: String
-            switch suggestion.safetyLevel {
-            case .safe: safetyIndicator = "✅ SAFE"
-            case .moderate: safetyIndicator = "⚠️ MODIFIES FILES/STATE"
-            case .destructive: safetyIndicator = "🔴 DESTRUCTIVE"
-            }
-
-            let confirmationMessage = """
-
-                COMMAND SUGGESTION:
-                \(suggestion.command)
-
-                EXPLANATION:
-                \(suggestion.explanation)
-
-                SAFETY: \(safetyIndicator)
-
-                Execute? (y/n): 
-                """
-
-            terminalWrapper.send(txt: "echo -e '\(confirmationMessage)'\n")
-
-            // In a real UI, we would wait for confirmation
-            // For demo purposes, auto-confirm safe commands
-            if suggestion.safetyLevel == .safe {
-                sendCommandToProcess(suggestion.command)  // Use helper
-            }
-        } else {
-            sendCommandToProcess(suggestion.command)  // Use helper
+    /// Execute a command with security validation and sandboxing
+    /// - Parameters:
+    ///   - command: Command string to execute
+    ///   - taskId: Task ID for tracking
+    ///   - isAIGenerated: Whether the command was generated by AI
+    private func executeCommandWithValidation(command: String, taskId: UUID, isAIGenerated: Bool) async {
+    // Determine appropriate security level based on command source
+    let securityLevel: CommandSandbox.SecurityLevel = isAIGenerated ? .strict : .standard
+    
+    // Create a security context for validation
+    let securityContext = SecurityContext(
+        level: securityLevel,
+        isAIGenerated: isAIGenerated,
+        timestamp: Date(),
+        violations: [],
+        lastCheck: Date()
+    )
+    
+    // STEP 1: Validate command security
+    do {
+        let validationResult = try validateCommandSecurity(command, context: securityContext)
+        
+        // Only proceed if validation passes
+        guard validationResult else {
+            throw TerminalError.securityViolation("Command failed validation without specific error")
         }
-    }
-
-    // Helper to send a command string to the process
-    public func sendCommandToProcess(_ command: String) {
-        let commandWithNewline = command + "\n"
-        if let data = commandWithNewline.data(using: .utf8) {
-            print("[TerminalSession] Sending command string: \(command)")  // DEBUG
+        
+        // STEP 2: Apply command sandboxing to the validated command
+        guard let sandboxedCommand = commandSandbox.sandboxCommand(
+            command, 
+            securityLevel: securityLevel,
+            isAIGenerated: isAIGenerated
+        ) else {
+            throw TerminalError.sandboxViolation("Command rejected by security sandbox")
+        }
+        
+        // STEP 3: Update task state to in-progress
+        Task {
+            await taskPersistenceManager.updateTaskState(taskId) { task in
+                task.status = .inProgress
+            }
+            
+            // Track active task
+            await MainActor.run {
+                if let task = activeTasks[taskId] {
+                    var updatedTask = task
+                    updatedTask.status = .inProgress
+                    activeTasks[taskId] = updatedTask
+                } else {
+                    logger.warning("Task \(taskId) not found in active tasks when updating to in-progress")
+                }
+            }
+        }
+        
+        // STEP 4: Execute the sandboxed command
+        let finalCommand = sandboxedCommand + "\n"
+        
+        // Record start time for duration tracking
+        let commandStartTime = Date()
+        
+        // Send the command to the process
+        if let data = finalCommand.data(using: .utf8) {
             sendToProcess(data: ArraySlice(data))
         }
+        
+        // STEP 5: Log command execution
+        Task {
+            await auditLogger.logCommandExecution(
+                command: command,
+                isAIGenerated: isAIGenerated,
+                workingDirectory: currentWorkingDirectory
+            )
+            
+            // Log execution time for performance monitoring
+            let executionDuration = Date().timeIntervalSince(commandStartTime)
+            logger.debug("Command execution initiated. Duration: \(executionDuration)s, AI-generated: \(isAIGenerated)")
+        }
+    } catch {
+        // Handle any errors during validation or sandboxing
+        await handleCommandFailure(
+            taskId: taskId,
+            error: error,
+            errorMessage: error is TerminalError.sandboxViolation ? "Command could not be executed due to sandbox restrictions" : "Security validation failed",
+            logMessage: error is TerminalError.sandboxViolation ? 
+                "Command sandbox failure: \(error.localizedDescription)" : 
+                "Security validation failed for command: \(command), error: \(error)",
+            command: command,
+            isAIGenerated: isAIGenerated,
+            securityEventType: error is TerminalError.sandboxViolation ? "sandboxViolation" : "command_rejected"
+        )
+    }
+}
+    
+    /// Helper method to handle command failures in a consistent way
+    /// - Parameters:
+    ///   - taskId: Task ID for tracking
+    ///   - error: The error that caused the failure
+    ///   - errorMessage: User-friendly error message
+    ///   - logMessage: Message to log
+    ///   - command: The original command
+    ///   - isAIGenerated: Whether the command was generated by AI
+    ///   - securityEventType: Type of security event to log
+    private func handleCommandFailure(
+        taskId: UUID,
+        error: Error,
+        errorMessage: String,
+        logMessage: String,
+        command: String,
+        isAIGenerated: Bool,
+        securityEventType: String
+    ) async {
+        // Update task state to failed
+        await taskPersistenceManager.failTask(taskId, error: error.localizedDescription)
+        
+        // Update in-memory task state
+        await MainActor.run {
+            if var task = activeTasks[taskId] {
+                task.status = .failed
+                activeTasks[taskId] = task
+            } else {
+                logger.warning("Task \(taskId) not found in active tasks when updating to failed")
+            }
+        }
+        
+        // Log the failure
+        logger.error(logMessage)
+        
+        // Remove task from activeTasks
+        await MainActor.run {
+            activeTasks.removeValue(forKey: taskId)
+        }
+        
+        // Notify terminal view about the failure
+        if let view = terminalView {
+            view.feed(text: "\r\n\u{1b}[31mSecurity error: \(errorMessage)\u{1b}[0m\r\n")
+        }
+        
+        // Log security event
+        Task {
+            await auditLogger.logEvent(
+                category: .security,
+                event: securityEventType,
+                message: errorMessage,
+                severity: .warning,
+                details: [
+                    "command": command,
+                    "isAIGenerated": String(isAIGenerated),
+                    "error": error.localizedDescription
+                ]
+            )
+        }
+    }
+    // Already moved to the top of the file
+    
+    /// Enhanced command security validation
+    private func validateCommandSecurity(_ command: String, context: SecurityContext) throws -> Bool {
+        // Update last security check
+        lastSecurityEvent = Date()
+        
+        // Basic security checks
+        guard !command.isEmpty else {
+            throw TerminalError.invalidCommand
+        }
+        
+        // Check for dangerous patterns
+        let dangerousPatterns = [
+            "rm -rf /",
+            "mkfs",
+            "> /dev/"
+        ]
+        
+        for pattern in dangerousPatterns {
+            if command.contains(pattern) {
+                throw TerminalError.securityViolation("Dangerous command pattern detected: \(pattern)")
+            }
+        }
+        
+        // Apply security level-specific checks
+        switch context.level {
+        case .strict:
+            // Stricter validation for AI-generated commands
+            let strictPatterns = [
+                "sudo",
+                "chmod",
+                "chown",
+                "dd",
+                "truncate"
+            ]
+            
+            for pattern in strictPatterns {
+                if command.contains(pattern) {
+                    throw TerminalError.securityViolation("Restricted command in strict mode: \(pattern)")
+                }
+            }
+            
+        case .standard:
+            // Standard validation
+            let standardPatterns = [
+                "rm -rf /*",
+                ":(){ :|:& };:",  // Fork bomb
+                "> /dev/sd"
+            ]
+            
+            for pattern in standardPatterns {
+                if command.contains(pattern) {
+                    throw TerminalError.securityViolation("Potentially dangerous command pattern: \(pattern)")
+                }
+            }
+        case .permissive:
+            // Minimal validation for permissive mode
+            break
+        }
+        
+        // Log security check
+        Task {
+            await auditLogger.logEvent(
+                category: .security,
+                event: "command_security_check",
+                message: "Security validation performed",
+                severity: .info,
+                details: context.asDictionary
+            )
+        }
+        
+        return true
     }
     
-    // MARK: - TerminalViewDelegate Methods
+    /// Enhanced recovery for tasks
+    private func prepareTaskRecovery(_ task: TaskState) async throws -> Bool {
+        guard let taskId = task.id else {
+            throw TerminalError.taskRecoveryFailed("Missing task ID")
+        }
+        
+        // Validate task state
+        guard task.status != .completed && task.status != .failed else {
+            throw TerminalError.taskRecoveryFailed("Task already completed or failed")
+        }
+        
+        // Build recovery context
+        var recoveryData: [String: Any] = [
+            "taskId": taskId.uuidString,
+            "timestamp": Date().timeIntervalSince1970,
+            "type": task.type.rawValue,
+            "status": task.status.rawValue
+        ]
+        
+        // Add task-specific data
+        if let taskData = task.data {
+            recoveryData["data"] = taskData
+        }
+        
+        // Add terminal state
+        recoveryData["terminalState"] = [
+            "workingDirectory": currentWorkingDirectory ?? "",
+            "aiMode": aiMode.rawValue,
+            "securityLevel": securityMonitoringEnabled ? "enabled" : "disabled"
+        ]
+        
+        // Store recovery context
+        self.recoveryContext = recoveryData
+        
+        // Log recovery preparation
+        await auditLogger.logEvent(
+            category: .system,
+            event: "recovery_preparation",
+            message: "Prepared task for recovery",
+            severity: .info,
+            details: recoveryData.mapValues { String(describing: $0) }
+        )
+        
+        return true
+    }
     
-    public func scrolled(source: TerminalView, position: Double) {
+    /// Log command execution with enhanced tracking
+    private func logCommandExecution(_ command: String, taskId: UUID, context: SecurityContext) async {
+        let historyEntry = CommandHistoryEntry(
+            command: command,
+            timestamp: Date(),
+            workingDirectory: currentWorkingDirectory,
+            exitCode: nil,
+            duration: 0,
+            securityContext: context.asDictionary
+        )
+        
+        // Since we're already in a @MainActor class, we don't need MainActor.run
+        commandHistory.append(historyEntry)
+        
+        // Trim history if needed
+        if commandHistory.count > 1000 {
+            commandHistory.removeFirst(commandHistory.count - 1000)
+        }
+        
+        // Log execution
+        await auditLogger.logCommandExecution(
+            command: command,
+            isAIGenerated: context.isAIGenerated,
+            workingDirectory: currentWorkingDirectory,
+            details: context.asDictionary
+        )
+    }
+
+    // MARK: - Window Management Methods
+    
+    /// Ensures the window for the terminal view is active
+    private func ensureWindowActive() {
+        guard let view = terminalView, let window = view.window else { return }
+        
+        // Only force activation if the window isn't already key or the view isn't first responder
+        if !window.isKeyWindow || window.firstResponder !== view {
+            DispatchQueue.main.async {
+                window.makeKeyAndOrderFront(nil)
+                window.makeFirstResponder(view)
+                let _ = view.becomeFirstResponder()
+            }
+        }
+    }
+    
+    // MARK: - State Management
+    
+    /// Saves the current session state
+    private func saveSessionState() {
+        // Don't save state too frequently
+        let now = Date()
+        if let lastSave = lastSessionStateSave, now.timeIntervalSince(lastSave) < 60.0 {
+            return  // Don't save more than once per minute
+        }
+        
+        lastSessionStateSave = now
+        
+        // Save session state using taskPersistenceManager
+        Task {
+            await taskPersistenceManager.saveSessionState(sessionId.uuidString, state: [
+                "startTime": sessionStartTime.timeIntervalSince1970.description,
+                "workingDirectory": currentWorkingDirectory ?? "",
+                "aiEnabled": String(aiEnabled),
+                "aiMode": aiMode.rawValue
+            ])
+        }
+    }
+    
+    /// Resets all components to their initial state
+    private func resetAllComponents() {
+        // Reset state properties
+        isRunning = false
+        lastOutput = ""
+        currentWorkingDirectory = FileManager.default.currentDirectoryPath
+        aiMode = .disabled
+        isProcessingAI = false
+        aiSuggestions = []
+        lastAIContext = nil
+        activeTasks.removeAll()
+        recoveryTasks = []
+        error = nil
+        statusMessage = "Initializing..."
+        
+        // Reset managers and handlers
+        processManager = nil
+        localProcess = nil
+    }
+    
+    // MARK: - TerminalViewDelegate Methods Implementation
+    
+    @MainActor public func scrolled(source: TerminalView, position: Double) {
         // Handle scrolling if needed
     }
     
-    public func titleChanged(source: TerminalView, title: String) {
+    @MainActor public func titleChanged(source: TerminalView, title: String) {
         // Update window title if needed
-    }
-    
-    public func sizeChanged(source: TerminalView, newCols: Int, newRows: Int) {
-        print("[TerminalSession] Size changed: \(newCols)x\(newRows)")
-        updateSize(cols: newCols, rows: newRows)
-    }
-    
-    public func setTerminalTitle(source: TerminalView, title: String) {
         if let window = source.window {
             window.title = title
         }
     }
-}  // End of TerminalSession class
+    
+    @MainActor public func sizeChanged(source: TerminalView, newCols: Int, newRows: Int) {
+        // Update size when terminal view size changes
+        updateSize(cols: newCols, rows: newRows)
+    }
+    
+    @MainActor public func setTerminalTitle(source: TerminalView, title: String) {
+        // Update window title if needed
+        if let window = source.window {
+            window.title = title
+        }
+    }
+    
+    @MainActor public func hostCurrentDirectoryUpdate(source: TerminalView, directory: String?) {
+        if let directory = directory {
+            currentWorkingDirectory = directory
+        }
+    }
+    
+    @MainActor public func clipboardCopy(source: TerminalView, content: Data) {
+        // Copy to clipboard using NSPasteboard
+        if let string = String(data: content, encoding: .utf8) {
+            let pasteboard = NSPasteboard.general
+            pasteboard.clearContents()
+            pasteboard.setString(string, forType: .string)
+        }
+    }
+    
+    // MARK: - TerminalSessionProtocol Methods Implementation
+    
+    /// Handles input data (implementation of TerminalSessionProtocol method)
+    public func handleInput(data: ArraySlice<UInt8>) {
+        // Forward to input handler
+        guard let processManager = processManager else { return }
+        inputHandler.handleInput(data: data, processManager: processManager)
+    }
+    
+    /// Processes output data (implementation of TerminalSessionProtocol method)
+    public func processOutput(data: ArraySlice<UInt8>) {
+        // Forward to output handler
+        outputHandler.processOutput(data: data, terminalView: terminalView, highlighter: commandHighlighter)
+    }
+    
+    /// Activates the terminal window (implementation of TerminalSessionProtocol method)
+    public func activateWindow() {
+        guard let view = terminalView else { return }
+        ensureWindowActive()
+    }
+    
+    /// Executes a suggested command (implementation of TerminalSessionProtocol method)
+    public func executeSuggestion(_ suggestion: CommandSuggestion) {
+        sendCommandToProcess(suggestion.command)
+    }
+    
+    // MARK: - Task Management
+    
+    /// Checks output for command completion
+    /// - Parameter output: Terminal output to check
+    private func checkForCommandCompletion(_ output: String) {
+        // This is a simple heuristic - in a real implementation, this would
+        // be more sophisticated, possibly using terminal control codes or
+        // special markers to detect command completion
+        
+        // Check for common shell prompt patterns
+        let promptPatterns = [
+            #"\$\s*$"#,        // bash/zsh $ prompt
+            #"%\s*$"#,         // zsh % prompt
+            #">\s*$"#,         // some shell prompts
+            #"]\$\s*$"#,       // common prompt pattern with bracket
+            #"[^:]+:\s*$"#     // user@host:path$ style prompts 
+        ]
+        
+        // Check if output contains a shell prompt at the end
+        let containsPrompt = promptPatterns.contains { pattern in
+            output.range(of: pattern, options: .regularExpression) != nil
+        }
+        
+        if containsPrompt {
+            // If we have a prompt, it indicates a command has completed
+            completeCurrentCommand(output)
+        }
+    }
+    
+    /// Completes the current command and updates tasks
+    /// - Parameter output: Command output
+    private func completeCurrentCommand(_ output: String) {
+        // Mark active commands as completed
+        Task {
+            // Get first in-progress task
+            let inProgressTasks = activeTasks.values.filter { $0.status == .inProgress }
+            
+            for task in inProgressTasks {
+                if let taskId = task.id {
+                    // Check for exit code - this is a simplistic way
+                    // In a real implementation, this would be more sophisticated
+                    let exitCode = 0  // Assume success for simplicity
+                    
+                    // Update task state
+                    let updatedTask = await taskPersistenceManager.updateTaskState(taskId) { task in
+                        task.status = .completed
+                        task.completedAt = Date()
+                        task.context?["exitCode"] = String(exitCode)
+                        task.context?["output"] = String(output.prefix(1000))  // Truncate long output
+                    }
+                    
+                    // Mark task as completed and archive it
+                    await taskPersistenceManager.completeTask(taskId)
+                    
+                    // Remove from active tasks
+                    await MainActor.run {
+                        activeTasks.removeValue(forKey: taskId)
+                    }
+                    
+                    // Log command completion
+                    await auditLogger.logEvent(
+                        category: .command,
+                        event: "command_completed",
+                        message: "Command completed successfully",
+                        severity: .info,
+                        details: [
+                            "taskId": taskId.uuidString,
+                            "exitCode": String(exitCode)
+                        ]
+                    )
+                }
+            }
+        }
+    }
+    
+    /// Completes all active tasks
+    /// - Parameter exitCode: Terminal exit code
+    private func completeAllActiveTasks(exitCode: Int32?) {
+        Task {
+            // Mark all active tasks as completed or failed
+            for (taskId, task) in activeTasks {
+                if let code = exitCode, code == 0 {
+                    // Normal termination - complete tasks
+                    await taskPersistenceManager.completeTask(taskId)
+                } else {
+                    // Abnormal termination - mark tasks as failed
+                    await taskPersistenceManager.failTask(
+                        taskId,
+                        error: "Terminal process terminated with exit code: \(exitCode ?? -1)"
+                    )
+                }
+            }
+            
+            // Clear active tasks
+            await MainActor.run {
+                activeTasks.removeAll()
+            }
+        }
+    }
+    
+    /// Checks for recovery tasks at startup
+    private func checkForRecoveryTasks() async {
+        do {
+            // Get tasks that need recovery
+            let tasks = await taskPersistenceManager.recoverFromCrash()
+            
+            // If we have recovery tasks, handle them
+            if !tasks.isEmpty {
+                await MainActor.run {
+                    recoveryTasks = tasks
+                }
+                
+                // Log recovery
+                await auditLogger.logEvent(
+                    category: .system,
+                    event: "recovery_tasks_found",
+                    message: "Found \(tasks.count) tasks to recover from previous session",
+                    severity: .info
+                )
+                
+                // Ask user if they want to recover
+                // In a real implementation, this would be a UI dialog
+                // For this example, we'll automatically attempt recovery with safety checks
+                var recoveredCount = 0
+                var failedCount = 0
+                
+                for task in tasks {
+                    // Only recover in-progress tasks that were interrupted
+                    if task.status == .inProgress {
+                        // Add extra validation for sensitive operations
+                        let isHighRiskTask = task.type == .fileOperation || 
+                                            (task.type == .aiCommand && task.description.contains("rm"))
+                        
+                        if isHighRiskTask {
+                            // Log but don't automatically recover high-risk tasks
+                            await auditLogger.logEvent(
+                                category: .security,
+                                event: "high_risk_task_recovery_skipped",
+                                message: "Skipped automatic recovery of high-risk task",
+                                severity: .warning,
+                                details: [
+                                    "taskId": task.id?.uuidString ?? "unknown",
+                                    "taskType": task.type.rawValue,
+                                    "description": task.description
+                                ]
+                            )
+                            
+                            // Mark as failed but with special context
+                            if let taskId = task.id {
+                                await taskPersistenceManager.updateTaskState(taskId) { state in
+                                    state.status = .paused
+                                    state.context?["recoveryStatus"] = "skipped_high_risk"
+                                }
+                            }
+                            
+                            // In a real app, this would prompt the user explicitly
+                            continue
+                        }
+                        
+                        // Apply recovery with proper error handling
+                        do {
+                            let success = await taskPersistenceManager.handleTaskRecovery(task)
+                            
+                            if success {
+                                recoveredCount += 1
+                            } else {
+                                failedCount += 1
+                            }
+                            
+                            await auditLogger.logEvent(
+                                category: .system,
+                                event: "task_recovery_attempt",
+                                message: "Recovery attempt for task: \(success ? "succeeded" : "failed")",
+                                severity: success ? .info : .warning,
+                                details: [
+                                    "taskId": task.id?.uuidString ?? "unknown",
+                                    "taskType": task.type.rawValue,
+                                    "description": task.description
+                                ]
+                            )
+                        } catch {
+                            failedCount += 1
+                            
+                            // Log the error
+                            await auditLogger.logError(
+                                error,
+                                context: "Task recovery",
+                                details: [
+                                    "taskId": task.id?.uuidString ?? "unknown",
+                                    "taskType": task.type.rawValue,
+                                    "description": task.description
+                                ]
+                            )
+                        }
+                    }
+                }
+                
+                // Log summary
+                if recoveredCount > 0 || failedCount > 0 {
+                    await auditLogger.logEvent(
+                        category: .system,
+                        event: "recovery_complete",
+                        message: "Task recovery process completed",
+                        severity: failedCount > 0 ? .warning : .info,
+                        details: [
+                            "recoveredCount": "\(recoveredCount)",
+                            "failedCount": "\(failedCount)",
+                            "totalTasks": "\(tasks.count)"
+                        ]
+                    )
+                }
+                
+                // Show recovery status to user
+                if let view = terminalView, recoveredCount > 0 {
+                    await MainActor.run {
+                        view.feed(text: "\r\n\u{1b}[32mRecovered \(recoveredCount) tasks from previous session\u{1b}[0m\r\n")
+                    }
+                }
+            }
+        } catch {
+            // Log any errors during recovery
+            await auditLogger.logError(
+                error,
+                context: "Recovery task initialization",
+                details: [
+                    "sessionId": sessionId.uuidString
+                ]
+            )
+            
+            // Notify the user
+            if let view = terminalView {
+                await MainActor.run {
+                    view.feed(text: "\r\n\u{1b}[31mError recovering tasks from previous session\u{1b}[0m\r\n")
+                }
+            }
+        }
+    }
+    
+    /// Saves the current session state for potential recovery
+    /// Recovers tasks from a previous session
+    /// - Returns: Array of recovered tasks
+    public func recoverTasks(_ tasks: [TaskState]) async {
+        guard !tasks.isEmpty else { return }
+        
+        logger.info("Recovering \(tasks.count) tasks")
+        
+        // Sort tasks by priority for recovery
+        let sortedTasks = tasks.sorted { $0.recoveryPriority > $1.recoveryPriority }
+        
+        // Process recovery
+        for task in sortedTasks {
+            // Handle based on task type
+            let success = await taskPersistenceManager.handleTaskRecovery(task)
+            
+            if success {
+                logger.info("Successfully recovered task: \(task.id?.uuidString ?? "unknown") - \(task.description)")
+                
+                // Notify terminal of successful recovery
+                await MainActor.run {
+                    if let view = terminalView {
+                        let message = "\r\n\u{1b}[32mRecovered: \(task.description)\u{1b}[0m\r\n"
+                        view.feed(text: message)
+                    }
+                }
+            } else {
+                logger.warning("Failed to recover task: \(task.id?.uuidString ?? "unknown") - \(task.description)")
+                
+                // Notify terminal of recovery failure
+                await MainActor.run {
+                    if let view = terminalView {
+                        let message = "\r\n\u{1b}[31mFailed to recover: \(task.description)\u{1b}[0m\r\n"
+                        view.feed(text: message)
+                    }
+                }
+            }
+            
+            // Small delay between recoveries
+            try? await Task.sleep(nanoseconds: 500_000_000)
+        }
+        
+        // Clear recovery tasks after processing
+        await MainActor.run {
+            recoveryTasks = []
+        }
+    }
+    
+    /// Clears recovery tasks without recovering them
+    public func clearRecoveryTasks() async {
+        // Clear recovery tasks
+        await taskPersistenceManager.clearRecoveryTasks()
+        
+        // Update UI
+        await MainActor.run {
+            recoveryTasks = []
+        }
+        
+        // Log the action
+        await auditLogger.logEvent(
+            category: .system,
+            event: "recovery_tasks_cleared",
+            message: "User cleared recovery tasks without recovering",
+            severity: .info,
+            details: [
+                "sessionId": sessionId.uuidString
+            ]
+        )
+    }
+}
+
+// MARK: - Extensions
+
+// Explicitly adopt TerminalViewDelegate protocol
+extension TerminalSession: TerminalViewDelegate {}
+
+// Make TerminalSession conform to ShellCommandExecutor for the terminal configuration
+extension TerminalSession: ShellCommandExecutor {
+    /// Executes a shell command
+    public func executeCommand(_ command: String) {
+        sendCommandToProcess(command)
+    }
+}
+
+// Make TerminalSession conform to ConfigurationDelegate
+extension TerminalSession: TerminalConfigurationDelegate {
+    public func configureTerminal(view: TerminalView) {
+        terminalConfiguration.configureTerminal(terminalView: view)
+    }
+    
+    public func windowDidActivate() {
+        // Ensure proper terminal focus
+        refreshTerminalState()
+    }
+}
+
+// Make TerminalSession conform to OutputProcessingDelegate
+extension TerminalSession: OutputProcessingDelegate {
+    public func didProcessOutput(_ output: String) {
+        // Process output for command completion detection
+        checkForCommandCompletion(output)
+    }
+}

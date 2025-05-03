@@ -62,6 +62,27 @@ public struct HighlightTheme: Equatable, Hashable, Sendable {
 
     /// Color for errors and warnings
     public let error: TerminalColor
+    
+    /// Color for success messages
+    public let success: TerminalColor
+    
+    /// Color for warning messages
+    public let warning: TerminalColor
+    
+    /// Color for information messages
+    public let info: TerminalColor
+    
+    /// Color for debug messages
+    public let debug: TerminalColor
+    
+    /// Background color for safe commands
+    public let safeBackground: TerminalColor
+    
+    /// Background color for moderate-risk commands
+    public let moderateBackground: TerminalColor
+    
+    /// Background color for dangerous commands
+    public let dangerousBackground: TerminalColor
 
     /// Creates a new HighlightTheme
     public init(
@@ -78,7 +99,14 @@ public struct HighlightTheme: Equatable, Hashable, Sendable {
         variable: TerminalColor,
         function: TerminalColor,
         path: TerminalColor,
-        error: TerminalColor
+        error: TerminalColor,
+        success: TerminalColor = .brightGreen,
+        warning: TerminalColor = .brightYellow,
+        info: TerminalColor = .brightBlue,
+        debug: TerminalColor = .brightCyan,
+        safeBackground: TerminalColor = .black,
+        moderateBackground: TerminalColor = .black,
+        dangerousBackground: TerminalColor = .black
     ) {
         self.name = name
         self.background = background
@@ -94,11 +122,19 @@ public struct HighlightTheme: Equatable, Hashable, Sendable {
         self.function = function
         self.path = path
         self.error = error
+        self.success = success
+        self.warning = warning
+        self.info = info
+        self.debug = debug
+        self.safeBackground = safeBackground
+        self.moderateBackground = moderateBackground
+        self.dangerousBackground = dangerousBackground
     }
 }
 
 /// Predefined terminal color themes
 extension HighlightTheme {
+    /// Dark theme with vibrant colors
     /// Dark theme with vibrant colors
     public static let dark = HighlightTheme(
         name: "Dark",
@@ -114,7 +150,14 @@ extension HighlightTheme {
         variable: .brightMagenta,
         function: .green,
         path: .cyan,
-        error: .red
+        error: .red,
+        success: .brightGreen,
+        warning: .brightYellow,
+        info: .brightBlue,
+        debug: .brightCyan,
+        safeBackground: .black,
+        moderateBackground: .blue,
+        dangerousBackground: .red
     )
 
     /// Light theme with subdued colors
@@ -132,7 +175,14 @@ extension HighlightTheme {
         variable: .magenta,
         function: .brightGreen,
         path: .brightCyan,
-        error: .brightRed
+        error: .brightRed,
+        success: .green,
+        warning: .yellow,
+        info: .blue,
+        debug: .cyan,
+        safeBackground: .white,
+        moderateBackground: .brightBlue,
+        dangerousBackground: .brightRed
     )
 
     /// High contrast theme
@@ -150,9 +200,40 @@ extension HighlightTheme {
         variable: .brightBlue,
         function: .brightYellow,
         path: .brightWhite,
-        error: .brightRed
+        error: .brightRed,
+        success: .brightGreen,
+        warning: .brightYellow,
+        info: .brightWhite,
+        debug: .brightCyan,
+        safeBackground: .black,
+        moderateBackground: .blue,
+        dangerousBackground: .red
     )
-}
+    
+    /// Safety-focused theme
+    public static let safety = HighlightTheme(
+        name: "Safety",
+        background: .black,
+        foreground: .white,
+        command: .green,
+        option: .cyan,
+        parameter: .brightCyan,
+        string: .yellow,
+        number: .magenta,
+        comment: .brightBlack,
+        keyword: .red,
+        variable: .brightMagenta,
+        function: .brightGreen,
+        path: .cyan,
+        error: .brightRed,
+        success: .brightGreen,
+        warning: .brightYellow,
+        info: .brightBlue,
+        debug: .brightCyan,
+        safeBackground: .green,
+        moderateBackground: .yellow,
+        dangerousBackground: .red
+    )
 
 /// Terminal colors for syntax highlighting
 public enum TerminalColor: String, Equatable, Hashable, Sendable {
@@ -173,7 +254,7 @@ public enum TerminalColor: String, Equatable, Hashable, Sendable {
     case brightCyan = "96"
     case brightWhite = "97"
 
-    /// Converts the color to an ANSI escape sequence for foreground color
+/// Converts the color to an ANSI escape sequence for foreground color
     public var ansiCode: String {
         return "\u{001B}[3\(rawValue)m"
     }
@@ -187,9 +268,9 @@ public enum TerminalColor: String, Equatable, Hashable, Sendable {
     public var ansiBackgroundCode: String {
         return "\u{001B}[4\(rawValue)m"
     }
-
-    /// ANSI reset code
-    public static let reset = "\u{001B}[0m"
+    
+    /// Converts the color to an ANSI escape sequence for bright background color
+194
 }
 
 /// Converts a TerminalColor to a SwiftUI Color
