@@ -2,7 +2,6 @@
 import PackageDescription
 
 let package = Package(
-    
     name: "LlamaTerminal",
     defaultLocalization: "en",
     platforms: [
@@ -67,7 +66,7 @@ let package = Package(
         .target(
             name: "AIIntegration",
             dependencies: [
-                "Alamofire",
+                .product(name: "Alamofire", package: "Alamofire"),
                 .product(name: "Markdown", package: "swift-markdown"),
             ],
             path: "Sources/AIIntegration",
@@ -79,8 +78,7 @@ let package = Package(
         .target(
             name: "SharedModels",
             dependencies: [
-                "TerminalCore",
-                "AIIntegration",
+                // No dependencies to avoid circular references
             ],
             path: "Sources/SharedModels",
             swiftSettings: [
@@ -105,15 +103,13 @@ let package = Package(
                 .unsafeFlags(["-cross-module-optimization"], .when(configuration: .release))
             ]
         ),
-        
         // Tests
         .testTarget(
             name: "TerminalCoreTests",
             dependencies: ["TerminalCore"],
             path: "Tests/TerminalCoreTests",
             swiftSettings: [
-                .unsafeFlags(["-profile-coverage-mapping", 
-                              "-profile-generate"])
+                .unsafeFlags(["-profile-coverage-mapping", "-profile-generate"])
             ]
         ),
         .testTarget(
