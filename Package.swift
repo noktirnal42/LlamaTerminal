@@ -2,7 +2,6 @@
 import PackageDescription
 
 let package = Package(
-    
     name: "LlamaTerminal",
     defaultLocalization: "en",
     platforms: [
@@ -57,7 +56,7 @@ let package = Package(
             name: "TerminalCore",
             dependencies: [
                 .product(name: "SwiftTerm", package: "SwiftTerm"),
-                "SharedModels", // Add SharedModels as a dependency
+                "SharedModels",
             ],
             path: "Sources/TerminalCore",
             swiftSettings: [
@@ -70,7 +69,7 @@ let package = Package(
             dependencies: [
                 "Alamofire",
                 .product(name: "Markdown", package: "swift-markdown"),
-                "SharedModels", // Add SharedModels as a dependency
+                "SharedModels",
             ],
             path: "Sources/AIIntegration",
             swiftSettings: [
@@ -81,8 +80,8 @@ let package = Package(
         .target(
             name: "SharedModels",
             dependencies: [
-                // AIIntegration dependency removed to fix circular dependency
-                // SharedModels should be a base module with no internal dependencies
+                // No dependencies to prevent circular dependencies
+                // SharedModels is a base module used by other modules
             ],
             path: "Sources/SharedModels",
             swiftSettings: [
@@ -110,6 +109,21 @@ let package = Package(
         
         // Tests
         .testTarget(
+            name: "AIIntegrationTests",
+            dependencies: [
+                "AIIntegration", 
+                "SharedModels"
+            ],
+            path: "Tests/AIIntegrationTests",
+            resources: [
+                .copy("TestResources")
+            ],
+            swiftSettings: [
+                .unsafeFlags(["-profile-coverage-mapping", 
+                              "-profile-generate"])
+            ]
+        ),
+        .testTarget(
             name: "TerminalCoreTests",
             dependencies: ["TerminalCore"],
             path: "Tests/TerminalCoreTests",
@@ -119,14 +133,13 @@ let package = Package(
             ]
         ),
         .testTarget(
-            name: "AIIntegrationTests",
-            dependencies: ["AIIntegration"],
-            path: "Tests/AIIntegrationTests"
-        ),
-        .testTarget(
             name: "UIComponentsTests",
             dependencies: ["UIComponents"],
-            path: "Tests/UIComponentsTests"
+            path: "Tests/UIComponentsTests",
+            swiftSettings: [
+                .unsafeFlags(["-profile-coverage-mapping", 
+                              "-profile-generate"])
+            ]
         ),
     ]
 )

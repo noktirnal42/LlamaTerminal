@@ -1,5 +1,5 @@
 {
-  "originHash" : "c0241774f7bae9ec0c10976dcd494fb078a6cc62372c109f29eff6923deaf7a1",
+  "originHash" : "2527a9e14a8cf4cb9ce0c2fc165e36a5ca3bc2a44541f95b44b6b463bf8f8b52",
   "pins" : [
     {
       "identity" : "alamofire",
@@ -34,7 +34,7 @@
       "location" : "https://github.com/migueldeicaza/SwiftTerm",
       "state" : {
         "branch" : "main",
-        "revision" : "c5f1d05135d22c5f856c714cda89629a54470aa0"
+        "revision" : "94b45c8b1acb3f9a8750fcd2bda0f3728f780e67"
       }
     }
   ],
